@@ -6,7 +6,7 @@ import {
   Cpu, Zap, Brain, Sliders, Database, Lock, User, LogIn,
   Terminal, Monitor, Wrench, Activity, Play, ShieldAlert, CheckCircle,
   Crown, Star, Filter, Plus, Trash2, X, UserPlus, Search, Shield, Eye,
-  Shuffle, Flame, Layers
+  Shuffle, Flame, Layers, Globe, ExternalLink, Square
 } from 'lucide-react';
 import { auth, googleAuthProvider } from './lib/firebase.ts';
 import { onAuthStateChanged, signInWithPopup, signOut, User as FirebaseUser } from 'firebase/auth';
@@ -38,6 +38,10 @@ interface WhatsAppStatus {
   currentAvatarUrl?: string;
   lastAvatarUpdated?: string | null;
   avatarCooldownRemaining?: number;
+  avatarBatch?: string[];
+  avatarBatchApplied?: string[];
+  avatarBatchNumber?: number;
+  avatarActiveThemeQuery?: string;
   logs: Array<{
     id: string;
     sender: 'contact' | 'ai' | 'system';
@@ -76,8 +80,44 @@ interface PersistentMessage {
   createdAt: string;
 }
 
+interface ZrokStatus {
+  binaryInstalled: boolean;
+  version: string | null;
+  isEnabled: boolean;
+  isRunning: boolean;
+  publicUrl: string | null;
+  customName: string;
+  autoStart: boolean;
+  hasToken: boolean;
+  maskedToken: string | null;
+  hasBasicAuth: boolean;
+  error: string | null;
+  logs: string[];
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'connect' | 'avatar' | 'ai' | 'cd'>('connect');
+  const [activeTab, setActiveTab] = useState<'connect' | 'avatar' | 'ai' | 'cd' | 'zrok'>('connect');
+  const [zrokStatus, setZrokStatus] = useState<ZrokStatus | null>(null);
+  const [zrokTokenInput, setZrokTokenInput] = useState('');
+  const [zrokCustomNameInput, setZrokCustomNameInput] = useState('');
+  const [zrokBasicAuthInput, setZrokBasicAuthInput] = useState('');
+  const [zrokAutoStartInput, setZrokAutoStartInput] = useState(false);
+  const [zrokActionLoading, setZrokActionLoading] = useState(false);
+  const [zrokCopiedUrl, setZrokCopiedUrl] = useState(false);
+  const [zrokTestLoading, setZrokTestLoading] = useState(false);
+  const [zrokTestReport, setZrokTestReport] = useState<{
+    success: boolean;
+    overallStatus: string;
+    checkedAt: string;
+    checks: Array<{
+      id: string;
+      name: string;
+      passed: boolean;
+      status: 'PASS' | 'WARN' | 'FAIL';
+      details: string;
+      durationMs: number;
+    }>;
+  } | null>(null);
   const [user, setUser] = useState<AppUser | FirebaseUser | null>(() => {
     try {
       const cached = localStorage.getItem('alexia_active_user');
@@ -135,8 +175,12 @@ export default function App() {
   const [generatingAvatar, setGeneratingAvatar] = useState(false);
   const [updatingAvatar, setUpdatingAvatar] = useState(false);
   const [selectedThemeCategory, setSelectedThemeCategory] = useState('Peisaje');
+  const [activeThemeQuery, setActiveThemeQuery] = useState('peisaj natura landscape munte apus');
   const [customSearchQuery, setCustomSearchQuery] = useState('');
   const [galleryPageOffset, setGalleryPageOffset] = useState(0);
+  const [appliedInBatch, setAppliedInBatch] = useState<string[]>([]);
+  const [seenGalleryUrls, setSeenGalleryUrls] = useState<string[]>([]);
+  const [autoNextBatchAfter5, setAutoNextBatchAfter5] = useState(true);
   const [themeGroupFilter, setThemeGroupFilter] = useState<'all' | 'popular' | 'scifi' | 'fantasy' | 'anomalies' | 'style'>('all');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const avatarInitializedRef = useRef(false);
@@ -402,30 +446,42 @@ export default function App() {
 
   const loadPinterestGallery = async (customQuery?: string, isNextPage: boolean = false) => {
     setGeneratingAvatar(true);
-    const queryToUse = customQuery || customSearchQuery || selectedThemeCategory || aiSettings.autoAvatarQuery || 'Peisaje';
-    const nextOffset = isNextPage ? galleryPageOffset + 1 : 0;
-    if (isNextPage) {
-      setGalleryPageOffset(nextOffset);
-    } else {
-      setGalleryPageOffset(0);
+    const queryToUse = (customQuery || customSearchQuery || activeThemeQuery || selectedThemeCategory || aiSettings.autoAvatarQuery || 'peisaj natura').trim();
+    if (customQuery) {
+      setActiveThemeQuery(customQuery.trim());
     }
+    const nextOffset = isNextPage ? galleryPageOffset + 1 : 0;
+    setGalleryPageOffset(nextOffset);
+    const excludeList = isNextPage ? seenGalleryUrls : [];
 
     try {
       const res = await fetch('/api/ai/search-images', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: queryToUse, offset: nextOffset }),
+        body: JSON.stringify({
+          query: queryToUse,
+          offset: nextOffset,
+          excludeUrls: excludeList,
+          syncTheme: true,
+        }),
       });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) {
+        throw new Error('Serverul nu a putut prelua imaginile acum.');
+      }
       const data = await res.json();
       if (data.images && data.images.length > 0) {
-        const images5 = data.images.slice(0, 5);
+        const images5: string[] = data.images.slice(0, 5);
         setSearchResults(images5);
-        if (!isNextPage) {
-          setCurrentAvatarUrl(images5[0]);
+        setAppliedInBatch([]);
+        setSeenGalleryUrls(prev => (isNextPage ? [...prev, ...images5].slice(-150) : images5));
+        setCurrentAvatarUrl(images5[0]);
+        if (data.syncedTheme) {
+          setAiSettings(prev => ({ ...prev, autoAvatarQuery: data.syncedTheme }));
         }
       }
     } catch (e) {
-      console.error('Load Pinterest gallery error:', e);
+      console.error('Load gallery error:', e);
     } finally {
       setGeneratingAvatar(false);
     }
@@ -434,15 +490,16 @@ export default function App() {
   const handleRandomTheme = () => {
     const randomTheme = ALL_THEMES[Math.floor(Math.random() * ALL_THEMES.length)];
     setSelectedThemeCategory(randomTheme.id);
+    setActiveThemeQuery(randomTheme.query);
     setCustomSearchQuery('');
     loadPinterestGallery(randomTheme.query, false);
-    setActionNotice({ type: 'info', text: `🎲 Temă aleatorie activată: "${randomTheme.label}"!` });
+    setActionNotice({ type: 'info', text: `🎲 Temă aleatorie activată: "${randomTheme.label}"! S-au descărcat 5 poze noi.` });
   };
 
-  // Auto-fetch 5 Pinterest images when opening profile picture tab
+  // Auto-fetch 5 images when opening profile picture tab
   useEffect(() => {
     if (activeTab === 'avatar' && searchResults.length === 0) {
-      loadPinterestGallery(selectedThemeCategory);
+      loadPinterestGallery(activeThemeQuery || selectedThemeCategory);
     }
   }, [activeTab]);
 
@@ -454,6 +511,150 @@ export default function App() {
       return () => clearInterval(interval);
     }
   }, [activeTab]);
+
+  const zrokPrefilledRef = useRef(false);
+  const fetchZrokStatus = async () => {
+    try {
+      const res = await fetchJsonSafe('/api/zrok/status');
+      if (res.ok && res.data?.success) {
+        const zData = res.data as ZrokStatus;
+        setZrokStatus(zData);
+        if (!zrokPrefilledRef.current) {
+          zrokPrefilledRef.current = true;
+          if (zData.customName) setZrokCustomNameInput(zData.customName);
+          setZrokAutoStartInput(Boolean(zData.autoStart));
+        }
+      }
+    } catch {}
+  };
+
+  useEffect(() => {
+    if (activeTab === 'zrok') {
+      fetchZrokStatus();
+      const interval = setInterval(fetchZrokStatus, 4000);
+      return () => clearInterval(interval);
+    }
+  }, [activeTab]);
+
+  const handleEnableZrok = async () => {
+    if (!zrokTokenInput.trim()) {
+      setActionNotice({ type: 'error', text: 'Introdu tokenul tău Zrok (obținut din contul zrok.io).' });
+      return;
+    }
+    setZrokActionLoading(true);
+    try {
+      const res = await fetch('/api/zrok/enable', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: zrokTokenInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Activarea Zrok a eșuat.');
+      }
+      setZrokStatus(data);
+      setZrokTokenInput('');
+      setActionNotice({ type: 'success', text: 'Zrok a fost activat cu succes! Acum poți porni site-ul public pe Zrok.' });
+    } catch (err: any) {
+      setActionNotice({ type: 'error', text: `Zrok: ${err.message}` });
+    } finally {
+      setZrokActionLoading(false);
+    }
+  };
+
+  const handleStartZrok = async () => {
+    setZrokActionLoading(true);
+    setActionNotice({ type: 'info', text: 'Se pornește tunelul public Zrok pentru întregul site...' });
+    try {
+      const res = await fetch('/api/zrok/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: zrokTokenInput.trim() || undefined,
+          customName: zrokCustomNameInput.trim(),
+          basicAuth: zrokBasicAuthInput.trim(),
+          autoStart: zrokAutoStartInput,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Nu s-a putut porni tunelul Zrok.');
+      }
+      setZrokStatus(data);
+      if (zrokTokenInput.trim()) setZrokTokenInput('');
+      setActionNotice({
+        type: 'success',
+        text: data.publicUrl
+          ? `Site-ul este LIVE pe Zrok: ${data.publicUrl}`
+          : 'Tunelul Zrok a pornit! Aștept alocarea adresei publice...',
+      });
+    } catch (err: any) {
+      setActionNotice({ type: 'error', text: `Zrok: ${err.message}` });
+      await fetchZrokStatus();
+    } finally {
+      setZrokActionLoading(false);
+    }
+  };
+
+  const handleStopZrok = async () => {
+    setZrokActionLoading(true);
+    try {
+      const res = await fetch('/api/zrok/stop', { method: 'POST' });
+      const data = await res.json();
+      setZrokStatus(data);
+      setActionNotice({ type: 'info', text: 'Tunelul Zrok a fost oprit.' });
+    } catch (err: any) {
+      setActionNotice({ type: 'error', text: `Zrok: ${err.message}` });
+    } finally {
+      setZrokActionLoading(false);
+    }
+  };
+
+  const handleDisableZrok = async () => {
+    setZrokActionLoading(true);
+    try {
+      const res = await fetch('/api/zrok/disable', { method: 'POST' });
+      const data = await res.json();
+      setZrokStatus(data);
+      setZrokCustomNameInput('');
+      setZrokBasicAuthInput('');
+      setZrokAutoStartInput(false);
+      setActionNotice({ type: 'info', text: 'Mediul Zrok a fost dezactivat și tokenul a fost șters.' });
+    } catch (err: any) {
+      setActionNotice({ type: 'error', text: `Zrok: ${err.message}` });
+    } finally {
+      setZrokActionLoading(false);
+    }
+  };
+
+  const handleCopyZrokUrl = (url: string) => {
+    navigator.clipboard.writeText(url);
+    setZrokCopiedUrl(true);
+    setTimeout(() => setZrokCopiedUrl(false), 2500);
+  };
+
+  const handleTestZrok = async () => {
+    setZrokTestLoading(true);
+    try {
+      const res = await fetch('/api/zrok/test', { method: 'POST' });
+      const data = await res.json();
+      setZrokTestReport(data);
+      await fetchZrokStatus();
+      setActionNotice({
+        type: data.overallStatus === 'ISSUE' ? 'error' : 'success',
+        text:
+          data.overallStatus === 'LIVE'
+            ? 'Test Zrok complet: Site-ul răspunde LIVE prin tunelul public Zrok!'
+            : data.overallStatus === 'ISSUE'
+            ? 'Test Zrok a detectat o problemă. Verifică lista de diagnostic de mai jos.'
+            : 'Test Zrok finalizat: Binarul, conexiunea cloud și proxy-ul funcționează corect!',
+      });
+    } catch (err: any) {
+      setActionNotice({ type: 'error', text: `Eroare test Zrok: ${err?.message || 'necunoscută'}` });
+    } finally {
+      setZrokTestLoading(false);
+    }
+  };
 
   // Auth Listener with Safety Timeout & Instant Local Storage Support
   useEffect(() => {
@@ -524,6 +725,7 @@ export default function App() {
     fetchCloudSqlStats();
     fetchPersistentMessages();
     fetchVipContacts();
+    fetchZrokStatus();
 
     const fastInterval = setInterval(runFastPoll, 3000);
     const slowInterval = setInterval(runSlowPoll, 8000);
@@ -973,18 +1175,47 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (!file.type.startsWith('image/')) {
-      setActionNotice({ type: 'error', text: 'Te rugăm să selectezi un fișier imagine valid (JPG, PNG, WebP, AVIF).' });
+    const looksLikeImage =
+      file.type.startsWith('image/') ||
+      /\.(jpe?g|png|webp|avif|svg|gif|heic|heif|tiff?|bmp|ico|jfif)$/i.test(file.name);
+
+    if (!looksLikeImage) {
+      setActionNotice({
+        type: 'error',
+        text: 'Te rugăm să selectezi un fișier imagine (JPG, PNG, WebP, AVIF, SVG, GIF, HEIC, TIFF, BMP).',
+      });
       return;
     }
 
     try {
-      setActionNotice({ type: 'info', text: 'Se optimizează imaginea la formatul standard WhatsApp 640x640 JPEG...' });
-      const optimizedJpeg = await processImageFileToJpeg(file);
+      setActionNotice({ type: 'info', text: 'Se optimizează imaginea (orice format -> 640x640 JPEG standard WhatsApp)...' });
+      let optimizedJpeg: string;
+      try {
+        optimizedJpeg = await processImageFileToJpeg(file);
+      } catch {
+        // Browser couldn't decode exotic format (e.g. HEIC / TIFF); convert via backend sharp
+        const rawDataUrl = await new Promise<string>((resolve, reject) => {
+          const r = new FileReader();
+          r.onerror = () => reject(new Error('Nu s-a putut citi fișierul.'));
+          r.onload = () => resolve(String(r.result || ''));
+          r.readAsDataURL(file);
+        });
+        const convRes = await fetch('/api/images/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ imageData: rawDataUrl }),
+        });
+        const convData = await convRes.json();
+        if (!convRes.ok || !convData.success || !convData.dataUrl) {
+          throw new Error(convData.error || 'Formatul imaginii nu a putut fi convertit.');
+        }
+        optimizedJpeg = convData.dataUrl;
+      }
+
       setCurrentAvatarUrl(optimizedJpeg);
-      setActionNotice({ 
-        type: 'success', 
-        text: 'Poză optimizată cu succes (640x640 JPEG)! Apasă pe "Aplică pe WhatsApp Acum" pentru a o trimite pe profilul tău.' 
+      setActionNotice({
+        type: 'success',
+        text: 'Poză optimizată cu succes (640x640 JPEG)! Apasă pe "Aplică pe WhatsApp Acum" pentru a o trimite pe profilul tău.',
       });
     } catch (err: any) {
       setActionNotice({ type: 'error', text: `Eroare: ${err.message || 'Nu s-a putut procesa imaginea.'}` });
@@ -993,29 +1224,63 @@ export default function App() {
 
   const handleUpdateWhatsAppAvatar = async () => {
     setUpdatingAvatar(true);
-    setActionNotice({ type: 'info', text: 'Se transmite poza către contul WhatsApp...' });
+    setActionNotice({ type: 'info', text: 'Se procesează formatul și se transmite poza pe profilul tău WhatsApp...' });
     try {
       const res = await fetch('/api/whatsapp/update-avatar', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ avatarUrl: currentAvatarUrl }),
       });
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error('Răspuns invalid de la server.');
+      }
       const data = await res.json();
-      if (data.success) {
+      if (res.ok && data.success) {
         if (data.rateLimited || data.pendingSync) {
-          setActionNotice({ 
-            type: 'info', 
-            text: `🛡️ ${data.message || 'Poza a fost salvată în profil! WhatsApp solicită o scurtă pauză de siguranță.'}` 
+          setActionNotice({
+            type: 'info',
+            text: `🛡️ ${data.message || 'Poza a fost salvată în profil! WhatsApp solicită o scurtă pauză de siguranță.'}`,
           });
         } else {
-          setActionNotice({ type: 'success', text: '✅ Imaginea de profil a fost actualizată cu succes pe contul tău WhatsApp!' });
+          // Photo successfully appeared on WhatsApp profile! Track progress in the current 5-image batch.
+          const isInCurrentRow = searchResults.includes(currentAvatarUrl);
+          const nextApplied = isInCurrentRow && !appliedInBatch.includes(currentAvatarUrl)
+            ? [...appliedInBatch, currentAvatarUrl]
+            : appliedInBatch;
+          setAppliedInBatch(nextApplied);
+
+          if (data.nextBatchDownloaded && Array.isArray(data.batchImages) && data.batchImages.length > 0) {
+            const new5 = data.batchImages.slice(0, 5);
+            setSearchResults(new5);
+            setAppliedInBatch([]);
+            setGalleryPageOffset(prev => (data.batchNumber ? Math.max(0, data.batchNumber - 1) : prev + 1));
+            setSeenGalleryUrls(prev => [...prev, ...new5].slice(-150));
+            setActionNotice({
+              type: 'success',
+              text: `✅ ${data.message}`,
+            });
+          } else if (autoNextBatchAfter5 && isInCurrentRow && nextApplied.length >= Math.min(5, searchResults.length)) {
+            setActionNotice({
+              type: 'success',
+              text: `✅ Toate cele 5 poze din lot au apărut pe profilul WhatsApp! Se descarcă automat următoarele 5 poze noi...`,
+            });
+            await loadPinterestGallery(activeThemeQuery, true);
+          } else {
+            setActionNotice({
+              type: 'success',
+              text: isInCurrentRow
+                ? `✅ Poza a apărut pe profilul WhatsApp (${nextApplied.length}/5 din lotul curent aplicate)!`
+                : '✅ Imaginea de profil a fost actualizată cu succes pe contul tău WhatsApp!',
+            });
+          }
         }
         await fetchStatus();
       } else {
         setActionNotice({ type: 'error', text: `❌ ${data.error || 'Nu s-a putut actualiza imaginea de profil.'}` });
       }
     } catch (e: any) {
-      setActionNotice({ type: 'error', text: '❌ Eroare la comunicarea cu serverul.' });
+      setActionNotice({ type: 'error', text: `❌ ${e?.message || 'Eroare la comunicarea cu serverul.'}` });
     } finally {
       setUpdatingAvatar(false);
     }
@@ -1023,17 +1288,26 @@ export default function App() {
 
   const handleTriggerAutoAvatar = async () => {
     setUpdatingAvatar(true);
-    setActionNotice({ type: 'info', text: 'Se caută și se schimbă imaginea conform temei...' });
+    setActionNotice({ type: 'info', text: 'Se aplică următoarea poză din lotul tematic pe WhatsApp...' });
     try {
       const res = await fetch('/api/whatsapp/trigger-auto-avatar', { method: 'POST' });
       const data = await res.json();
       if (data.success) {
+        if (data.url) setCurrentAvatarUrl(data.url);
         if (data.rateLimited || data.pendingSync) {
           setActionNotice({ type: 'info', text: `🛡️ ${data.message}` });
         } else {
-          setActionNotice({ type: 'success', text: '✅ Imaginea a fost schimbată cu succes conform temei tale!' });
+          if (data.nextBatchDownloaded && Array.isArray(data.batchImages) && data.batchImages.length > 0) {
+            const new5 = data.batchImages.slice(0, 5);
+            setSearchResults(new5);
+            setAppliedInBatch([]);
+            setGalleryPageOffset(prev => (data.batchNumber ? Math.max(0, data.batchNumber - 1) : prev + 1));
+            setSeenGalleryUrls(prev => [...prev, ...new5].slice(-150));
+          } else if (data.url && searchResults.includes(data.url)) {
+            setAppliedInBatch(prev => (prev.includes(data.url) ? prev : [...prev, data.url]));
+          }
+          setActionNotice({ type: 'success', text: `✅ ${data.message || 'Imaginea a fost schimbată cu succes conform temei tale!'}` });
         }
-        if (data.url) setCurrentAvatarUrl(data.url);
         await fetchStatus();
       } else {
         setActionNotice({ type: 'error', text: data.error || 'Eroare la schimbarea imaginii.' });
@@ -1194,6 +1468,18 @@ export default function App() {
             <Terminal className="w-4 h-4 text-emerald-400" />
             <span>Terminal PC <span className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/30">cd</span></span>
           </button>
+          <button
+            onClick={() => setActiveTab('zrok')}
+            className={`px-4 py-2 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer ${
+              activeTab === 'zrok'
+                ? 'bg-slate-800 text-cyan-300 font-semibold border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Globe className="w-4 h-4 text-cyan-400" />
+            <span>Tunel Zrok</span>
+            {zrokStatus?.isRunning && <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>}
+          </button>
         </nav>
 
         {/* User profile and Database Status */}
@@ -1236,6 +1522,10 @@ export default function App() {
         <button onClick={() => setActiveTab('avatar')} className={`px-3 py-1.5 text-xs rounded-md whitespace-nowrap ${activeTab === 'avatar' ? 'bg-slate-800 text-white font-semibold' : 'text-slate-400'}`}>Poza Profil</button>
         <button onClick={() => setActiveTab('ai')} className={`px-3 py-1.5 text-xs rounded-md whitespace-nowrap ${activeTab === 'ai' ? 'bg-slate-800 text-white font-semibold' : 'text-slate-400'}`}>Toți AI &amp; Jurnal</button>
         <button onClick={() => setActiveTab('cd')} className={`px-3 py-1.5 text-xs rounded-md whitespace-nowrap ${activeTab === 'cd' ? 'bg-slate-800 text-emerald-400 font-semibold' : 'text-slate-400'}`}>Terminal PC cd</button>
+        <button onClick={() => setActiveTab('zrok')} className={`px-3 py-1.5 text-xs rounded-md whitespace-nowrap flex items-center gap-1.5 ${activeTab === 'zrok' ? 'bg-slate-800 text-cyan-300 font-semibold' : 'text-slate-400'}`}>
+          <span>Tunel Zrok</span>
+          {zrokStatus?.isRunning && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>}
+        </button>
       </div>
 
       <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
@@ -1888,6 +2178,13 @@ export default function App() {
                     alt="Avatar WhatsApp" 
                     className="relative w-52 h-52 sm:w-56 sm:h-56 rounded-full object-cover shadow-2xl border-4 border-emerald-500/60 ring-4 ring-slate-900 bg-slate-900" 
                     referrerPolicy="no-referrer"
+                    onError={(e) => {
+                      const imgEl = e.target as HTMLImageElement;
+                      if (!imgEl.dataset.proxied && currentAvatarUrl.startsWith('http')) {
+                        imgEl.dataset.proxied = '1';
+                        imgEl.src = `/api/images/proxy?url=${encodeURIComponent(currentAvatarUrl)}`;
+                      }
+                    }}
                   />
                   {updatingAvatar && (
                     <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm rounded-full flex flex-col items-center justify-center text-white text-xs gap-2.5 z-10">
@@ -1907,12 +2204,12 @@ export default function App() {
                   <span>{status.isConnected ? 'Aplică pe WhatsApp Acum' : 'Salvează Poză în Profil'}</span>
                 </button>
 
-                {/* Local Upload from Phone / PC */}
+                {/* Local Upload from Phone / PC (ANY image format) */}
                 <input 
                   type="file" 
                   ref={fileInputRef} 
                   onChange={handleFileUpload} 
-                  accept="image/png, image/jpeg, image/jpg, image/webp, image/avif, image/*" 
+                  accept="image/*,.heic,.heif,.avif,.webp,.svg,.tiff,.tif,.bmp,.ico,.jfif" 
                   className="hidden" 
                 />
                 <button
@@ -1921,7 +2218,7 @@ export default function App() {
                   className="w-full py-3 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-slate-200 text-xs font-bold rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer hover:border-slate-500 active:scale-95"
                 >
                   <Upload className="w-4 h-4 text-emerald-400" />
-                  <span>Încarcă Poză din Telefon / Calculator</span>
+                  <span>Încarcă Orice Format de Poză (JPG, PNG, WebP, AVIF, HEIC, SVG)</span>
                 </button>
 
                 {/* Instant Next Image in Batch Trigger Button with Live 5-Min Timer */}
@@ -1929,7 +2226,7 @@ export default function App() {
                   type="button"
                   onClick={() => {
                     handleTriggerAutoAvatar();
-                    setAutoTimerSeconds(300); // Reset timer
+                    setAutoTimerSeconds(300);
                   }}
                   disabled={updatingAvatar}
                   className="w-full py-3 bg-purple-950/70 hover:bg-purple-900/80 border border-purple-700/70 disabled:opacity-50 text-purple-200 text-xs font-bold rounded-xl transition-all flex flex-col items-center justify-center gap-1.5 cursor-pointer active:scale-95 shadow-md shadow-purple-950/40"
@@ -1951,7 +2248,7 @@ export default function App() {
                     <span>Protecție Inteligentă Anti-Rate-Limit</span>
                   </div>
                   <p className="text-[10px] text-slate-400 leading-relaxed">
-                    WhatsApp solicită o scurtă pauză de siguranță (~60 secunde) între actualizările succesive de profil. Sistemul gestionează automat această limită fără erori și sincronizează poza în siguranță.
+                    Orice format (WebP, AVIF, PNG, JPG, SVG, HEIC, TIFF) este convertit automat în 640x640 JPEG. După ce toate cele 5 poze din lot apar pe profilul WhatsApp, se descarcă automat următorul rând de 5 poze noi.
                   </p>
                 </div>
               </div>
@@ -1959,7 +2256,7 @@ export default function App() {
               {/* Right Column: Themes, Search, 5-Image Gallery & Auto-Rotation (7 Cols) */}
               <div className="lg:col-span-7 space-y-6">
                 
-                {/* 5-Image Pinterest Display Container */}
+                {/* 5-Image Multi-Site Display Container */}
                 <div className="p-6 bg-slate-950 rounded-2xl border border-slate-800 space-y-5 shadow-inner">
                   
                   {/* Realm Category Filter & Thematic Explorer */}
@@ -1967,10 +2264,9 @@ export default function App() {
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <label className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                         <Flame className="w-4 h-4 text-amber-400" />
-                        <span>Alege din Toate Temele Posibile & Imposibile</span>
+                        <span>Alege din Toate Temele Posibile &amp; Imposibile</span>
                       </label>
 
-                      {/* Random Theme Button */}
                       <button
                         type="button"
                         onClick={handleRandomTheme}
@@ -2017,6 +2313,7 @@ export default function App() {
                             type="button"
                             onClick={() => {
                               setSelectedThemeCategory(cat.id);
+                              setActiveThemeQuery(cat.query);
                               setCustomSearchQuery('');
                               loadPinterestGallery(cat.query, false);
                             }}
@@ -2032,14 +2329,16 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Custom Search Bar */}
-                  <div className="pt-2">
+                  {/* Custom Search Bar OR Direct Website/Image URL */}
+                  <div className="pt-2 space-y-1.5">
                     <form 
                       onSubmit={(e) => {
                         e.preventDefault();
                         if (customSearchQuery.trim()) {
-                          setSelectedThemeCategory(customSearchQuery.trim());
-                          loadPinterestGallery(customSearchQuery.trim(), false);
+                          const q = customSearchQuery.trim();
+                          setSelectedThemeCategory(q);
+                          setActiveThemeQuery(q);
+                          loadPinterestGallery(q, false);
                         }
                       }}
                       className="flex gap-2"
@@ -2050,7 +2349,7 @@ export default function App() {
                           type="text"
                           value={customSearchQuery}
                           onChange={(e) => setCustomSearchQuery(e.target.value)}
-                          placeholder="Sau caută orice alt cuvânt (ex: ocean, flori, Porsche 911, neon samurai)..."
+                          placeholder="Caută orice temă sau lipește un link de pe orice site cu poze (https://...)..."
                           className="w-full pl-10 pr-4 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                         />
                       </div>
@@ -2060,67 +2359,95 @@ export default function App() {
                         className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shrink-0 shadow-md shadow-emerald-600/20"
                       >
                         <Search className="w-3.5 h-3.5" />
-                        <span>Caută</span>
+                        <span>Caută / Extrage</span>
                       </button>
                     </form>
+                    <p className="text-[10px] text-slate-500">
+                      Caută simultan pe Pinterest, Bing Images, Wallhaven, Wikimedia sau lipește direct adresa (URL) a oricărui site / imagini.
+                    </p>
                   </div>
 
-                  {/* Exact 5-Image Pinterest Display Grid */}
+                  {/* Exact 5-Image Multi-Site Display Grid */}
                   <div className="space-y-3 pt-2">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <label className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                         <Image className="w-4 h-4 text-emerald-400" />
-                        <span>Lotul Curent de 5 Imagini Pinterest</span>
+                        <span>Lotul #{galleryPageOffset + 1} • 5 Poze Noi ({appliedInBatch.length}/5 pe WhatsApp)</span>
                       </label>
-                      <span className="text-[10px] text-slate-500">Apasă pe oricare pentru previzualizare</span>
+                      <label className="flex items-center gap-1.5 text-[10px] text-slate-400 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={autoNextBatchAfter5}
+                          onChange={(e) => setAutoNextBatchAfter5(e.target.checked)}
+                          className="accent-emerald-500 rounded"
+                        />
+                        <span>Descarcă alte 5 automat după 5/5 pe WhatsApp</span>
+                      </label>
                     </div>
 
                     {generatingAvatar ? (
                       <div className="py-14 flex flex-col items-center justify-center text-slate-400 text-xs gap-3">
                         <RefreshCw className="w-8 h-8 animate-spin text-emerald-400" />
-                        <span className="font-semibold text-slate-300">Se preiau 5 imagini de înaltă rezoluție de pe Pinterest...</span>
+                        <span className="font-semibold text-slate-300">Se descarcă 5 imagini noi de pe web / Pinterest pentru tema selectată...</span>
                       </div>
                     ) : searchResults.length > 0 ? (
                       <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-                        {searchResults.slice(0, 5).map((url, i) => (
-                          <div 
-                            key={i}
-                            onClick={() => setCurrentAvatarUrl(url)}
-                            className={`rounded-2xl overflow-hidden aspect-square border-2 transition-all cursor-pointer relative group ${
-                              currentAvatarUrl === url ? 'border-emerald-500 ring-4 ring-emerald-500/25 scale-[1.02] shadow-lg shadow-emerald-950/50' : 'border-slate-800 hover:border-slate-600'
-                            }`}
-                          >
-                            <img 
-                              src={url} 
-                              alt={`Pinterest ${i + 1}`} 
-                              className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-300" 
-                              referrerPolicy="no-referrer"
-                              onError={(e) => {
-                                (e.target as HTMLImageElement).src = `https://picsum.photos/seed/fallback_${i}_${Date.now()}/640/640.jpg`;
-                              }}
-                            />
-                            
-                            {/* Number badge */}
-                            <div className="absolute top-2 left-2 bg-slate-950/70 backdrop-blur-sm px-1.5 py-0.5 rounded-md text-[9px] font-mono font-bold text-slate-300">
-                              #{i + 1}
-                            </div>
-
-                            {/* Active Checkmark overlay */}
-                            {currentAvatarUrl === url && (
-                              <div className="absolute inset-0 bg-emerald-950/40 backdrop-blur-[1px] flex items-center justify-center">
-                                <div className="w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center shadow-lg">
-                                  <Check className="w-5 h-5 text-white stroke-[3]" />
-                                </div>
+                        {searchResults.slice(0, 5).map((url, i) => {
+                          const isAppliedOnWa = appliedInBatch.includes(url);
+                          const isSelected = currentAvatarUrl === url;
+                          return (
+                            <div 
+                              key={`${galleryPageOffset}_${i}`}
+                              onClick={() => setCurrentAvatarUrl(url)}
+                              className={`rounded-2xl overflow-hidden aspect-square border-2 transition-all cursor-pointer relative group ${
+                                isSelected ? 'border-emerald-500 ring-4 ring-emerald-500/25 scale-[1.02] shadow-lg shadow-emerald-950/50' : 'border-slate-800 hover:border-slate-600'
+                              }`}
+                            >
+                              <img 
+                                src={url} 
+                                alt={`Poză ${i + 1}`} 
+                                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-300" 
+                                referrerPolicy="no-referrer"
+                                onError={(e) => {
+                                  const imgEl = e.target as HTMLImageElement;
+                                  if (!imgEl.dataset.proxied && url.startsWith('http')) {
+                                    imgEl.dataset.proxied = '1';
+                                    imgEl.src = `/api/images/proxy?url=${encodeURIComponent(url)}`;
+                                  } else {
+                                    imgEl.src = `https://picsum.photos/seed/fallback_${galleryPageOffset}_${i}/640/640.jpg`;
+                                  }
+                                }}
+                              />
+                              
+                              {/* Number badge */}
+                              <div className="absolute top-2 left-2 bg-slate-950/80 backdrop-blur-sm px-1.5 py-0.5 rounded-md text-[9px] font-mono font-bold text-slate-200">
+                                #{i + 1}
                               </div>
-                            )}
-                          </div>
-                        ))}
+
+                              {/* Applied on WhatsApp badge */}
+                              {isAppliedOnWa && (
+                                <div className="absolute bottom-1.5 left-1.5 right-1.5 bg-emerald-600/90 backdrop-blur-sm px-1.5 py-0.5 rounded-md text-[9px] font-bold text-white text-center truncate">
+                                  Pe WhatsApp ✓
+                                </div>
+                              )}
+
+                              {/* Active Checkmark overlay */}
+                              {isSelected && (
+                                <div className="absolute inset-0 bg-emerald-950/35 backdrop-blur-[1px] flex items-center justify-center">
+                                  <div className="w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center shadow-lg">
+                                    <Check className="w-5 h-5 text-white stroke-[3]" />
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     ) : (
                       <div className="p-8 text-center text-xs text-slate-400 space-y-3">
                         <p>Nu sunt imagini încărcate.</p>
                         <button
-                          onClick={() => loadPinterestGallery(selectedThemeCategory)}
+                          onClick={() => loadPinterestGallery(activeThemeQuery || selectedThemeCategory)}
                           className="px-4 py-2 bg-emerald-600 text-white font-bold rounded-xl text-xs"
                         >
                           Încarcă Imagini
@@ -2131,16 +2458,16 @@ export default function App() {
                     {/* Pagination / Fetch other 5 pictures */}
                     <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
                       <span className="text-[11px] text-slate-500 font-mono">
-                        Selecția curentă: #{searchResults.indexOf(currentAvatarUrl) !== -1 ? searchResults.indexOf(currentAvatarUrl) + 1 : 'Personalizată'} din 5
+                        Selecția curentă: #{searchResults.indexOf(currentAvatarUrl) !== -1 ? searchResults.indexOf(currentAvatarUrl) + 1 : 'Personalizată'} din 5 • Lot #{galleryPageOffset + 1}
                       </span>
 
                       <button
-                        onClick={() => loadPinterestGallery(undefined, true)}
+                        onClick={() => loadPinterestGallery(activeThemeQuery, true)}
                         disabled={generatingAvatar}
                         className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-emerald-400 border border-slate-700/80 text-xs font-semibold rounded-xl transition-all flex items-center gap-2 cursor-pointer hover:border-slate-600 active:scale-95"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${generatingAvatar ? 'animate-spin' : ''}`} />
-                        <span>Încarcă Alte 5 Poze din Această Temă</span>
+                        <span>Descarcă Alte 5 Poze din Această Temă</span>
                       </button>
                     </div>
                   </div>
@@ -2920,6 +3247,299 @@ export default function App() {
 
             </div>
 
+          </div>
+        )}
+
+        {/* TAB 5: TUNEL ZROK (SITE PUBLIC PE ZROK.IO) */}
+        {activeTab === 'zrok' && (
+          <div className="space-y-6">
+            <div className="bg-slate-900 rounded-3xl border border-cyan-500/30 p-6 md:p-8 shadow-2xl space-y-6">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-6">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
+                    <Globe className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                      <span>Accesare completă prin Zrok</span>
+                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-cyan-300 border border-slate-700">
+                        {zrokStatus?.version || 'v2.0.9'}
+                      </span>
+                    </h2>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Expune întregul site (Interfață Web + API + Bot WhatsApp + Poze) printr-un tunel HTTPS securizat <code className="text-cyan-300">*.zrok.io</code>.
+                    </p>
+                  </div>
+                </div>
+
+                <div className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-xl border text-xs font-bold ${
+                  zrokStatus?.isRunning && zrokStatus?.publicUrl
+                    ? 'bg-emerald-950/60 border-emerald-700/60 text-emerald-300'
+                    : zrokStatus?.isEnabled
+                    ? 'bg-amber-950/50 border-amber-700/50 text-amber-300'
+                    : 'bg-slate-950 border-slate-800 text-slate-400'
+                }`}>
+                  <span className={`w-2.5 h-2.5 rounded-full ${
+                    zrokStatus?.isRunning && zrokStatus?.publicUrl
+                      ? 'bg-emerald-400 animate-pulse'
+                      : zrokStatus?.isEnabled
+                      ? 'bg-amber-400'
+                      : 'bg-slate-600'
+                  }`} />
+                  <span>
+                    {zrokStatus?.isRunning && zrokStatus?.publicUrl
+                      ? 'LIVE PE ZROK'
+                      : zrokStatus?.isEnabled
+                      ? 'ZROK ACTIVAT (OPRIT)'
+                      : 'NECESITĂ TOKEN ZROK'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Live Public URL Box */}
+              {zrokStatus?.isRunning && zrokStatus?.publicUrl && (
+                <div className="p-5 bg-emerald-950/30 border border-emerald-600/40 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="space-y-1 min-w-0">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400">
+                      Link-ul Public al Site-ului prin Zrok:
+                    </span>
+                    <div className="font-mono text-sm md:text-base font-bold text-white truncate">
+                      {zrokStatus.publicUrl}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => handleCopyZrokUrl(zrokStatus.publicUrl!)}
+                      className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 border border-slate-700 cursor-pointer"
+                    >
+                      {zrokCopiedUrl ? <CheckCheck className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4 text-slate-300" />}
+                      <span>{zrokCopiedUrl ? 'Copiat!' : 'Copiază Link'}</span>
+                    </button>
+                    <a
+                      href={zrokStatus.publicUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold flex items-center gap-1.5"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                      <span>Deschide Site</span>
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* Step 1: Zrok Token & Enable */}
+                <div className="bg-slate-950 rounded-2xl border border-slate-800 p-5 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <KeyRound className="w-4 h-4 text-cyan-400" />
+                      <span>1. Token cont Zrok {zrokStatus?.isEnabled ? '(Configurat ✓)' : ''}</span>
+                    </h3>
+                    {zrokStatus?.maskedToken && (
+                      <span className="text-[11px] font-mono px-2 py-0.5 bg-slate-900 text-slate-400 rounded border border-slate-800">
+                        {zrokStatus.maskedToken}
+                      </span>
+                    )}
+                  </div>
+
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    Obține un token gratuit din contul tău{' '}
+                    <a
+                      href="https://api-v2.zrok.io"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-cyan-400 hover:underline font-semibold"
+                    >
+                      api-v2.zrok.io
+                    </a>{' '}
+                    (secțiunea <em>Account Token / Enable Environment</em>) și lipește-l mai jos o singură dată.
+                  </p>
+
+                  <div className="flex gap-2">
+                    <input
+                      type="password"
+                      value={zrokTokenInput}
+                      onChange={(e) => setZrokTokenInput(e.target.value)}
+                      placeholder={zrokStatus?.isEnabled ? 'Introdu alt token doar dacă vrei să-l schimbi...' : 'Lipește tokenul tău Zrok aici...'}
+                      className="flex-1 px-3.5 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white focus:outline-none focus:border-cyan-500"
+                    />
+                    <button
+                      onClick={handleEnableZrok}
+                      disabled={zrokActionLoading || !zrokTokenInput.trim()}
+                      className="px-4 py-2.5 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold whitespace-nowrap cursor-pointer"
+                    >
+                      Activează Token
+                    </button>
+                  </div>
+
+                  {zrokStatus?.isEnabled && (
+                    <div className="flex items-center justify-between pt-2 border-t border-slate-900 text-[11px]">
+                      <span className="text-emerald-400 font-semibold flex items-center gap-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>Mediul local zrok2 este activat și salvat persistent.</span>
+                      </span>
+                      <button
+                        onClick={handleDisableZrok}
+                        disabled={zrokActionLoading}
+                        className="text-red-400 hover:text-red-300 font-semibold cursor-pointer"
+                      >
+                        Dezactivează
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Step 2: Start / Stop Tunnel & Options */}
+                <div className="bg-slate-950 rounded-2xl border border-slate-800 p-5 space-y-4">
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <Zap className="w-4 h-4 text-amber-400" />
+                    <span>2. Pornire Tunel Public (Întregul Site)</span>
+                  </h3>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className="text-[11px] font-semibold text-slate-400">
+                        Subdomeniu personalizat (opțional)
+                      </label>
+                      <input
+                        type="text"
+                        value={zrokCustomNameInput}
+                        onChange={(e) => setZrokCustomNameInput(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                        placeholder="ex: alexia-whatsapp"
+                        className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white focus:outline-none focus:border-cyan-500"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-[11px] font-semibold text-slate-400">
+                        Parolă Basic Auth (opțional)
+                      </label>
+                      <input
+                        type="text"
+                        value={zrokBasicAuthInput}
+                        onChange={(e) => setZrokBasicAuthInput(e.target.value)}
+                        placeholder="ex: admin:parola123"
+                        className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white focus:outline-none focus:border-cyan-500"
+                      />
+                    </div>
+                  </div>
+
+                  <label className="flex items-center gap-2.5 text-xs text-slate-300 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={zrokAutoStartInput}
+                      onChange={(e) => setZrokAutoStartInput(e.target.checked)}
+                      className="rounded border-slate-700 bg-slate-900 text-cyan-500 focus:ring-cyan-500"
+                    />
+                    <span>Pornește tunelul Zrok automat la fiecare pornire a serverului</span>
+                  </label>
+
+                  <div className="flex flex-wrap items-center gap-3 pt-1">
+                    <button
+                      onClick={handleStartZrok}
+                      disabled={zrokActionLoading || (!zrokStatus?.isEnabled && !zrokTokenInput.trim())}
+                      className="flex-1 min-w-[180px] px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      {zrokActionLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                      <span>{zrokStatus?.isRunning ? 'Repornește prin Zrok' : 'Pornește Site-ul prin Zrok'}</span>
+                    </button>
+                    {zrokStatus?.isRunning && (
+                      <button
+                        onClick={handleStopZrok}
+                        disabled={zrokActionLoading}
+                        className="px-4 py-2.5 bg-red-600/80 hover:bg-red-600 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Square className="w-3.5 h-3.5" />
+                        <span>Oprește</span>
+                      </button>
+                    )}
+                    <button
+                      onClick={handleTestZrok}
+                      disabled={zrokTestLoading}
+                      className="px-4 py-2.5 bg-cyan-600/20 hover:bg-cyan-600/30 border border-cyan-500/40 text-cyan-300 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      {zrokTestLoading ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Activity className="w-3.5 h-3.5" />}
+                      <span>{zrokTestLoading ? 'Se testează...' : 'Testează Zrok'}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Zrok Diagnostic Test Report */}
+              {zrokTestReport && (
+                <div className="bg-slate-950 rounded-2xl border border-cyan-500/30 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-white flex items-center gap-2">
+                      <Activity className="w-4 h-4 text-cyan-400" />
+                      <span>Rezultat Test Diagnostic Zrok</span>
+                    </span>
+                    <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded border ${
+                      zrokTestReport.overallStatus === 'LIVE' || zrokTestReport.overallStatus === 'READY'
+                        ? 'bg-emerald-950/60 border-emerald-700 text-emerald-300'
+                        : zrokTestReport.overallStatus === 'NEEDS_TOKEN'
+                        ? 'bg-amber-950/60 border-amber-700 text-amber-300'
+                        : 'bg-red-950/60 border-red-700 text-red-300'
+                    }`}>
+                      {zrokTestReport.overallStatus}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                    {zrokTestReport.checks.map((chk) => (
+                      <div key={chk.id} className="p-3 bg-slate-900/70 rounded-xl border border-slate-800 space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-white">{chk.name}</span>
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                            chk.status === 'PASS'
+                              ? 'bg-emerald-500/20 text-emerald-300'
+                              : chk.status === 'WARN'
+                              ? 'bg-amber-500/20 text-amber-300'
+                              : 'bg-red-500/20 text-red-300'
+                          }`}>
+                            {chk.status} ({chk.durationMs}ms)
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 leading-relaxed">{chk.details}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Error & Logs Console */}
+              {zrokStatus?.error && (
+                <div className="p-3.5 bg-red-950/50 border border-red-700/50 rounded-xl text-xs text-red-200 flex items-center gap-2">
+                  <ShieldAlert className="w-4 h-4 text-red-400 shrink-0" />
+                  <span>{zrokStatus.error}</span>
+                </div>
+              )}
+
+              <div className="bg-slate-950 rounded-2xl border border-slate-800 p-4 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                    <Terminal className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Jurnal live zrok2</span>
+                  </span>
+                  <button
+                    onClick={fetchZrokStatus}
+                    className="text-[11px] text-slate-400 hover:text-white flex items-center gap-1 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    <span>Reîmprospătează</span>
+                  </button>
+                </div>
+                <div className="bg-black/60 rounded-xl p-3 font-mono text-[11px] text-slate-300 max-h-44 overflow-y-auto space-y-1">
+                  {zrokStatus?.logs && zrokStatus.logs.length > 0 ? (
+                    zrokStatus.logs.map((line, idx) => (
+                      <div key={idx} className="break-all leading-relaxed">
+                        {line}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-slate-500">Niciun eveniment Zrok înregistrat încă. Introdu tokenul și pornește tunelul pentru a primi URL-ul public.</div>
+                  )}
+                </div>
+              </div>
+            </div>
           </div>
         )}
 

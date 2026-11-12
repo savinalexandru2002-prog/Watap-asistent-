@@ -15,10 +15,21 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { Jimp } from 'jimp';
+import sharp from 'sharp';
 import { saveWaMessage, getRecentWaMessages } from './src/db/messages.ts';
 import { getSetting, setSetting } from './src/db/settings.ts';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
 import { getOrCreateUser } from './src/db/users.ts';
+import {
+  getZrokStatus,
+  enableZrok,
+  startZrokTunnel,
+  stopZrokTunnel,
+  disableZrok,
+  updateZrokPreferences,
+  autoStartZrokIfConfigured,
+  runZrokDiagnostics,
+} from './src/lib/zrokManager.ts';
 
 dotenv.config();
 
@@ -350,49 +361,102 @@ function getSampleVideoForQuery(query: string): string {
 }
 
 /**
- * Helper to fetch image buffer safely with browser headers requesting strictly JPEG/PNG to avoid unsupported AVIF format
+ * Fetches an image buffer from ANY website URL or data URL (supports JPEG, PNG, WebP, AVIF, SVG, GIF, HEIC, TIFF, BMP)
  */
-async function fetchImageBuffer(avatarUrl: string): Promise<Buffer> {
+async function fetchImageBuffer(avatarUrl: string, allowFallback: boolean = true): Promise<Buffer> {
   if (avatarUrl.startsWith('data:')) {
-    const base64Data = avatarUrl.split(',')[1] || avatarUrl;
-    return Buffer.from(base64Data, 'base64');
+    const commaIdx = avatarUrl.indexOf(',');
+    const meta = commaIdx >= 0 ? avatarUrl.slice(0, commaIdx) : '';
+    const payload = commaIdx >= 0 ? avatarUrl.slice(commaIdx + 1) : avatarUrl;
+    if (meta.includes(';base64')) {
+      return Buffer.from(payload, 'base64');
+    }
+    return Buffer.from(decodeURIComponent(payload), 'utf-8');
   }
 
-  const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+  const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  let refererOrigin = 'https://www.google.com/';
+  try {
+    refererOrigin = new URL(avatarUrl).origin + '/';
+  } catch {}
 
   try {
     const fetchRes = await fetch(avatarUrl, {
       headers: {
         'User-Agent': userAgent,
-        // Explicitly request JPEG and PNG only to avoid AVIF/WebP decoding errors in Jimp
-        'Accept': 'image/jpeg, image/png, image/jpg;q=0.9, image/*;q=0.5',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Referer': refererOrigin,
       },
       redirect: 'follow',
+      signal: AbortSignal.timeout(12000),
     });
 
     if (!fetchRes.ok) {
-      console.warn(`Fetch returned status ${fetchRes.status} for ${avatarUrl}, falling back to default JPEG image`);
       throw new Error(`HTTP status ${fetchRes.status}`);
     }
 
+    const contentType = (fetchRes.headers.get('content-type') || '').toLowerCase();
     const arrayBuf = await fetchRes.arrayBuffer();
-    return Buffer.from(arrayBuf);
+    const buf = Buffer.from(arrayBuf);
+
+    if (buf.length < 32) {
+      throw new Error('Fișier imagine gol sau corupt');
+    }
+    if (contentType.includes('text/html')) {
+      throw new Error('Linkul a returnat o pagină HTML în loc de o imagine directă');
+    }
+
+    return buf;
   } catch (err) {
+    if (!allowFallback) {
+      throw err;
+    }
     console.warn(`Primary image fetch failed for ${avatarUrl}, using fallback JPEG...`, err);
     const fallbackUrl = DEFAULT_AVATARS[Math.floor(Math.random() * DEFAULT_AVATARS.length)];
-    const fallbackRes = await fetch(fallbackUrl, { 
-      headers: { 
+    const fallbackRes = await fetch(fallbackUrl, {
+      headers: {
         'User-Agent': userAgent,
-        'Accept': 'image/jpeg, image/png',
-      } 
+        'Accept': 'image/*',
+      },
+      signal: AbortSignal.timeout(10000),
     });
     const arrayBuf = await fallbackRes.arrayBuffer();
     return Buffer.from(arrayBuf);
   }
 }
 
+/**
+ * Converts ANY image format (JPEG, PNG, WebP, AVIF, SVG, GIF, TIFF, HEIC, BMP) into 640x640 JPEG for WhatsApp
+ */
+async function convertAnyImageBufferToJpeg640(imageBuffer: Buffer): Promise<Buffer> {
+  try {
+    return await sharp(imageBuffer, { animated: false, limitInputPixels: false })
+      .rotate()
+      .flatten({ background: { r: 15, g: 23, b: 42 } })
+      .resize(640, 640, { fit: 'cover', position: 'centre' })
+      .jpeg({ quality: 88, mozjpeg: true })
+      .toBuffer();
+  } catch (sharpErr) {
+    // Fallback to Jimp for formats like BMP or uncommon PNGs
+    try {
+      const jimpInstance = await Jimp.read(imageBuffer);
+      const minDim = Math.min(jimpInstance.width, jimpInstance.height);
+      const startX = Math.floor((jimpInstance.width - minDim) / 2);
+      const startY = Math.floor((jimpInstance.height - minDim) / 2);
+      const cropped = jimpInstance.crop({ x: startX, y: startY, w: minDim, h: minDim });
+      const resized = cropped.resize({ w: 640, h: 640 });
+      return await resized.getBuffer('image/jpeg', { quality: 88 });
+    } catch (jimpErr) {
+      throw sharpErr || jimpErr;
+    }
+  }
+}
+
 let autoAvatarBatch: string[] = [];
 let autoAvatarBatchIndex = 0;
+let autoAvatarPageOffset = 0;
+let autoAvatarAppliedInBatch: string[] = [];
+const autoAvatarSeenUrls = new Set<string>();
 let lastAutoAvatarQuery = '';
 
 /**
@@ -759,99 +823,342 @@ function getThemedImagePool(cleanQuery: string): string[] {
   return [];
 }
 
-/**
- * Generates/Fetches a fresh batch of 5 images for a given query
- */
-async function fetch5ImagesForQuery(query: string, pageOffset: number = 0): Promise<string[]> {
-  const cleanQuery = (query || 'abstract').toLowerCase().trim();
-  
-  // 1. Try to fetch real Pinterest images via public search scraping
-  try {
-    const encodedQuery = encodeURIComponent(cleanQuery);
-    const pinterestUrl = `https://www.pinterest.com/search/pins/?q=${encodedQuery}`;
-    
-    const response = await fetch(pinterestUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      }
-    });
+const BLOCKED_WATERMARK_DOMAINS = [
+  'shutterstock.com',
+  'istockphoto.com',
+  'gettyimages.com',
+  'alamy.com',
+  'dreamstime.com',
+  '123rf.com',
+  'depositphotos.com',
+  'vecteezy.com',
+  'stock.adobe.com',
+];
 
-    if (response.ok) {
-      const html = await response.text();
-      // Regex to find Pinterest image URLs (i.pinimg.com)
-      // Usually they look like https://i.pinimg.com/736x/... or /originals/...
-      const imgRegex = /https:\/\/i\.pinimg\.com\/[^\s"']+\.jpg/g;
-      const matches = Array.from(new Set(html.match(imgRegex) || []));
-      
-      if (matches.length > 5) {
-        console.log(`[PINTEREST_SCRAPE] Successfully found ${matches.length} real Pinterest images for "${cleanQuery}"`);
-        // Filter out very small thumbnails if possible, prefer 736x or originals
-        const highRes = matches.filter(url => url.includes('/736x/') || url.includes('/564x/'));
-        const sourceList = highRes.length > 5 ? highRes : matches;
-        
-        const start = (pageOffset * 5) % sourceList.length;
-        return sourceList.slice(start, start + 5);
-      }
+function isCleanCandidateImageUrl(url: string): boolean {
+  if (!url || !/^https?:\/\//i.test(url)) return false;
+  const lower = url.toLowerCase();
+  if (lower.includes('favicon') || lower.includes('1x1') || lower.includes('pixel.') || lower.includes('/sprite')) {
+    return false;
+  }
+  if (BLOCKED_WATERMARK_DOMAINS.some((dom) => lower.includes(dom))) {
+    return false;
+  }
+  return true;
+}
+
+async function isImageUrlReachable(url: string): Promise<boolean> {
+  try {
+    let refererOrigin = 'https://www.google.com/';
+    try {
+      refererOrigin = new URL(url).origin + '/';
+    } catch {}
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Range': 'bytes=0-1024',
+        'Referer': refererOrigin,
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(3500),
+    });
+    if (!res.ok) return false;
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (ct.includes('text/html') || ct.includes('application/json')) return false;
+    return ct.startsWith('image/') || /\.(jpg|jpeg|png|webp|avif|gif|svg|bmp|heic|tiff)(\?|$)/i.test(url);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extracts images from ANY webpage URL or accepts direct image URLs (any format)
+ */
+async function extractImagesFromAnyWebsite(targetUrl: string): Promise<string[]> {
+  const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  try {
+    const res = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': userAgent,
+        'Accept': 'text/html,application/xhtml+xml,image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return [];
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (ct.startsWith('image/')) {
+      return [res.url || targetUrl];
     }
-  } catch (scrapeErr) {
-    console.warn('[PINTEREST_SCRAPE] Failed to fetch real-time Pinterest results:', scrapeErr);
+    const html = await res.text();
+    const baseUrl = res.url || targetUrl;
+    const rawCandidates: string[] = [];
+
+    const addResolved = (raw?: string) => {
+      if (!raw) return;
+      const cleaned = raw.trim().replace(/&amp;/g, '&').replace(/^['"]|['"]$/g, '');
+      if (!cleaned || (cleaned.startsWith('data:image/svg+xml') && cleaned.length < 180)) return;
+      if (cleaned.startsWith('data:image/')) {
+        rawCandidates.push(cleaned);
+        return;
+      }
+      try {
+        const abs = new URL(cleaned, baseUrl).toString();
+        if (isCleanCandidateImageUrl(abs)) {
+          rawCandidates.push(abs);
+        }
+      } catch {}
+    };
+
+    for (const m of html.matchAll(/<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image|twitter:image:src)["'][^>]+content=["']([^"']+)["']/gi)) {
+      addResolved(m[1]);
+    }
+    for (const m of html.matchAll(/<img[^>]+(?:data-src|data-lazy-src|data-original|src)=["']([^"']+)["']/gi)) {
+      addResolved(m[1]);
+    }
+    for (const m of html.matchAll(/<(?:img|source)[^>]+srcset=["']([^"']+)["']/gi)) {
+      const entries = m[1].split(',').map((s) => s.trim().split(/\s+/)[0]).filter(Boolean);
+      if (entries.length > 0) addResolved(entries[entries.length - 1]);
+    }
+    for (const m of html.matchAll(/background-image\s*:\s*url\(["']?([^"')]+)["']?\)/gi)) {
+      addResolved(m[1]);
+    }
+    const unescaped = html.replace(/\\\//g, '/');
+    for (const m of unescaped.matchAll(/https?:\/\/[^\s"'<>\\]+\.(?:jpg|jpeg|png|webp|avif|gif|svg|bmp|heic|tiff)(?:\?[^\s"'<>\\]*)?/gi)) {
+      addResolved(m[0]);
+    }
+
+    return Array.from(new Set(rawCandidates));
+  } catch (err) {
+    console.warn(`[ANY_SITE_SCRAPE] Failed scraping ${targetUrl}:`, err);
+    return [];
+  }
+}
+
+/**
+ * Universal Multi-Site Image Search: fetches 5 fresh images for ANY theme, keyword, or website URL
+ * Sources: Direct Website URL scraping, Bing Images (cross-site), Pinterest, Wallhaven API, Wikimedia Commons API, + curated fallback
+ */
+async function fetch5ImagesForQuery(
+  query: string,
+  pageOffset: number = 0,
+  excludeUrls: Set<string> = new Set()
+): Promise<string[]> {
+  const rawQuery = (query || 'abstract').trim();
+  const cleanQuery = rawQuery.toLowerCase();
+  const browserHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/*,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,ro;q=0.8',
+  };
+
+  // Case 1: User pasted a direct website URL or direct image URL
+  if (/^https?:\/\//i.test(rawQuery)) {
+    const siteImages = await extractImagesFromAnyWebsite(rawQuery);
+    const freshSiteImages = siteImages.filter((u) => !excludeUrls.has(u));
+    const pool = freshSiteImages.length > 0 ? freshSiteImages : siteImages;
+    if (pool.length > 0) {
+      const start = (pageOffset * 5) % pool.length;
+      const sliced = pool.slice(start, start + 5);
+      while (sliced.length < 5 && pool.length > 1 && sliced.length < pool.length) {
+        const extra = pool[(start + sliced.length) % pool.length];
+        if (!sliced.includes(extra)) sliced.push(extra);
+        else break;
+      }
+      return sliced;
+    }
   }
 
-  // 2. Fallback to Curated Pool
-  const pool = getThemedImagePool(cleanQuery);
-  let results: string[] = [];
+  // Case 2: Multi-Site Real Web Image Search (Bing cross-site + Pinterest + Wallhaven + Wikimedia)
+  const encodedQuery = encodeURIComponent(rawQuery);
+  const bingPageFirst = pageOffset * 15 + 1;
+  const wallhavenPage = pageOffset + 1;
+  const wikiOffset = pageOffset * 12;
 
+  const [bingList, pinterestList, wallhavenList, wikiList] = await Promise.all([
+    (async (): Promise<string[]> => {
+      try {
+        const bingUrl = `https://www.bing.com/images/search?q=${encodedQuery}&first=${bingPageFirst}&safeSearch=Moderate`;
+        const r = await fetch(bingUrl, { headers: browserHeaders, signal: AbortSignal.timeout(5500) });
+        if (!r.ok) return [];
+        const html = await r.text();
+        const found: string[] = [];
+        for (const m of html.matchAll(/murl&quot;:&quot;(https?:\/\/[^&]+?)&quot;/g)) {
+          const url = m[1].replace(/\\u002f/gi, '/').replace(/&amp;/g, '&');
+          if (isCleanCandidateImageUrl(url)) found.push(url);
+        }
+        return Array.from(new Set(found));
+      } catch {
+        return [];
+      }
+    })(),
+
+    (async (): Promise<string[]> => {
+      try {
+        const pinterestUrl = `https://www.pinterest.com/search/pins/?q=${encodedQuery}`;
+        const r = await fetch(pinterestUrl, { headers: browserHeaders, signal: AbortSignal.timeout(5500) });
+        if (!r.ok) return [];
+        const html = (await r.text()).replace(/\\\//g, '/');
+        const matches = html.match(/https:\/\/i\.pinimg\.com\/(?:originals|736x|564x|474x)\/[a-zA-Z0-9\/_-]+\.(?:jpg|jpeg|png|webp|avif|gif)/gi) || [];
+        const unique = Array.from(new Set(matches));
+        const start = pageOffset === 0 ? 0 : (pageOffset * 5) % Math.max(1, unique.length);
+        return [...unique.slice(start), ...unique.slice(0, start)];
+      } catch {
+        return [];
+      }
+    })(),
+
+    (async (): Promise<string[]> => {
+      try {
+        const whUrl = `https://wallhaven.cc/api/v1/search?q=${encodedQuery}&purity=100&sorting=relevance&page=${wallhavenPage}`;
+        const r = await fetch(whUrl, { headers: browserHeaders, signal: AbortSignal.timeout(5000) });
+        if (!r.ok) return [];
+        const data = await r.json();
+        const items = Array.isArray(data?.data) ? data.data : [];
+        return items
+          .map((item: any) => item?.thumbs?.large || item?.path)
+          .filter((u: any) => typeof u === 'string' && isCleanCandidateImageUrl(u));
+      } catch {
+        return [];
+      }
+    })(),
+
+    (async (): Promise<string[]> => {
+      try {
+        const wikiUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodedQuery}&gsrlimit=12&gsroffset=${wikiOffset}&prop=imageinfo&iiprop=url|mime&iiurlwidth=800&format=json`;
+        const r = await fetch(wikiUrl, { headers: browserHeaders, signal: AbortSignal.timeout(5000) });
+        if (!r.ok) return [];
+        const data = await r.json();
+        const pages = Object.values(data?.query?.pages || {}) as any[];
+        return pages
+          .map((p) => p?.imageinfo?.[0]?.thumburl || p?.imageinfo?.[0]?.url)
+          .filter((u: any) => typeof u === 'string' && isCleanCandidateImageUrl(u));
+      } catch {
+        return [];
+      }
+    })(),
+  ]);
+
+  const combinedCandidates: string[] = [];
+  const maxLen = Math.max(pinterestList.length, wallhavenList.length, bingList.length, wikiList.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (pinterestList[i]) combinedCandidates.push(pinterestList[i]);
+    if (wallhavenList[i]) combinedCandidates.push(wallhavenList[i]);
+    if (bingList[i]) combinedCandidates.push(bingList[i]);
+    if (wikiList[i]) combinedCandidates.push(wikiList[i]);
+  }
+
+  const dedupedLive = Array.from(new Set(combinedCandidates)).filter((u) => !excludeUrls.has(u));
+
+  const verified: string[] = [];
+  const candidatesToProbe = dedupedLive.slice(0, 18);
+  const probeResults = await Promise.all(
+    candidatesToProbe.map(async (url) => ((await isImageUrlReachable(url)) ? url : null))
+  );
+  for (const okUrl of probeResults) {
+    if (okUrl && !verified.includes(okUrl)) {
+      verified.push(okUrl);
+      if (verified.length >= 5) break;
+    }
+  }
+
+  if (verified.length >= 5) {
+    console.log(`[MULTI_SITE_IMAGES] Batch #${pageOffset + 1} for "${cleanQuery}": 5 verified images`);
+    return verified.slice(0, 5);
+  }
+
+  const pool = getThemedImagePool(cleanQuery).filter((u) => !excludeUrls.has(u) && !verified.includes(u));
   if (pool.length > 0) {
     const start = (pageOffset * 5) % pool.length;
-    for (let i = 0; i < 5; i++) {
-      results.push(pool[(start + i) % pool.length]);
+    for (let i = 0; i < pool.length && verified.length < 5; i++) {
+      const candidate = pool[(start + i) % pool.length];
+      if (!verified.includes(candidate)) verified.push(candidate);
     }
-    return results;
   }
 
-  // 3. Last Resort: Robust Fallback with Unsplash/Picsum IDs
-  const seedBase = cleanQuery.split('').reduce((acc: number, char: string) => acc + char.charCodeAt(0), 0) + pageOffset * 23;
+  if (verified.length >= 5) {
+    return verified.slice(0, 5);
+  }
+
+  const seedBase = cleanQuery.split('').reduce((acc: number, char: string) => acc + char.charCodeAt(0), 0) + pageOffset * 37;
   const verifiedPhotoIds = [
     '1534528741775-53994a69daeb', '1507003211169-0a1dd7228f2d', '1573496359142-b8d87734a5a2',
     '1500648767791-00dcc994a43e', '1517841905240-472988babdf9', '1539571696357-5a69c17a67c6',
     '1522335789203-aabd1fc54bc9', '1509198397868-475647b2a1e5', '1518709268805-4e9042af9f23',
     '1579783902614-a3fb3927b675', '1514539079130-25950c84af65', '1607604276583-eef5d076aa5f',
-    '1550745165-9bc0b252726f', '1511512578047-dfb367046420', '1503376780353-7e6692767b70'
+    '1550745165-9bc0b252726f', '1511512578047-dfb367046420', '1503376780353-7e6692767b70',
   ];
 
-  while (results.length < 5) {
-    const idx = (seedBase + results.length) % verifiedPhotoIds.length;
-    const photoId = verifiedPhotoIds[idx];
-    const url = `https://images.unsplash.com/photo-${photoId}?w=640&auto=format&fit=crop&q=85&fm=jpg`;
-    if (!results.includes(url)) {
-      results.push(url);
+  let safetyLoop = 0;
+  while (verified.length < 5 && safetyLoop < 30) {
+    safetyLoop++;
+    const idx = (seedBase + safetyLoop) % verifiedPhotoIds.length;
+    const url = `https://images.unsplash.com/photo-${verifiedPhotoIds[idx]}?w=640&auto=format&fit=crop&q=85&fm=jpg`;
+    if (!verified.includes(url) && !excludeUrls.has(url)) {
+      verified.push(url);
     } else {
-      const fallbackId = 10 + ((seedBase + results.length) * 11) % 240;
-      results.push(`https://picsum.photos/id/${fallbackId}/640/640.jpg`);
+      const fallbackId = 10 + ((seedBase + safetyLoop) * 13) % 400;
+      const picsumUrl = `https://picsum.photos/id/${fallbackId}/640/640.jpg`;
+      if (!verified.includes(picsumUrl) && !excludeUrls.has(picsumUrl)) {
+        verified.push(picsumUrl);
+      }
     }
   }
 
-  return results.slice(0, 5);
+  return verified.slice(0, 5);
 }
 
 /**
- * Sequential 5-image batch rotator: returns image 1, then 2, 3, 4, 5, then fetches 5 new images and repeats endlessly
+ * Ensures autoAvatarBatch has a fresh 5-image batch for the active theme
  */
-async function getNextAvatarFromBatch(): Promise<string> {
-  const currentQuery = aiSettings.autoAvatarQuery || 'pinterest aesthetic wallpaper';
-  
-  if (currentQuery !== lastAutoAvatarQuery || autoAvatarBatch.length === 0 || autoAvatarBatchIndex >= autoAvatarBatch.length) {
-    console.log(`Downloading fresh batch of 5 images for query: "${currentQuery}"...`);
-    autoAvatarBatch = await fetch5ImagesForQuery(currentQuery);
+async function ensureAutoAvatarBatch(forceNextPage: boolean = false): Promise<string[]> {
+  const currentQuery = aiSettings.autoAvatarQuery || 'peisaj natura';
+
+  if (currentQuery !== lastAutoAvatarQuery) {
+    autoAvatarPageOffset = 0;
+    autoAvatarBatch = [];
     autoAvatarBatchIndex = 0;
+    autoAvatarAppliedInBatch = [];
     lastAutoAvatarQuery = currentQuery;
+  } else if (forceNextPage) {
+    autoAvatarPageOffset++;
+    autoAvatarBatch = [];
+    autoAvatarBatchIndex = 0;
+    autoAvatarAppliedInBatch = [];
   }
 
-  const selectedUrl = autoAvatarBatch[autoAvatarBatchIndex];
-  console.log(`Auto-Avatar batch step: Image ${autoAvatarBatchIndex + 1} of ${autoAvatarBatch.length}`);
-  autoAvatarBatchIndex++;
+  if (autoAvatarBatch.length === 0) {
+    console.log(`[AUTO_AVATAR_BATCH] Downloading batch #${autoAvatarPageOffset + 1} (5 images) for theme: "${currentQuery}"...`);
+    autoAvatarBatch = await fetch5ImagesForQuery(currentQuery, autoAvatarPageOffset, autoAvatarSeenUrls);
+    autoAvatarBatch.forEach((u) => autoAvatarSeenUrls.add(u));
+    if (autoAvatarSeenUrls.size > 200) {
+      autoAvatarSeenUrls.clear();
+    }
+    autoAvatarBatchIndex = 0;
+    autoAvatarAppliedInBatch = [];
+  }
+
+  return autoAvatarBatch;
+}
+
+/**
+ * Sequential 5-image batch rotator: returns next unapplied image from current batch of 5;
+ * downloads next batch of 5 ONLY after the current batch of 5 has finished applying to WhatsApp!
+ */
+async function getNextAvatarFromBatch(): Promise<string> {
+  await ensureAutoAvatarBatch(false);
+
+  const nextUnapplied = autoAvatarBatch.find((u) => !autoAvatarAppliedInBatch.includes(u));
+  if (!nextUnapplied) {
+    await ensureAutoAvatarBatch(true);
+  } else if (autoAvatarBatchIndex >= autoAvatarBatch.length) {
+    autoAvatarBatchIndex = Math.max(0, autoAvatarBatch.indexOf(nextUnapplied));
+  }
+
+  const selectedUrl = autoAvatarBatch[autoAvatarBatchIndex] || nextUnapplied || autoAvatarBatch[0];
+  console.log(`[AUTO_AVATAR_BATCH] Lot #${autoAvatarPageOffset + 1}, Image ${autoAvatarBatchIndex + 1}/${autoAvatarBatch.length}`);
   return selectedUrl;
 }
 
@@ -863,57 +1170,56 @@ let lastProcessedUrl = '';
 const MIN_AVATAR_COOLDOWN_MS = 60 * 1000;
 
 /**
- * Updates the WhatsApp profile picture with rate-overlimit protection and persistent state
+ * Updates the WhatsApp profile picture (accepts ANY image format, converts to 640x640 JPEG via sharp/Jimp),
+ * and when all 5 images in the current batch have appeared on WhatsApp profile, automatically downloads the next 5!
  */
-async function performAvatarUpdate(url: string): Promise<{ success: boolean; rateLimited?: boolean; pendingSync?: boolean; error?: string; message?: string }> {
+async function performAvatarUpdate(url: string): Promise<{
+  success: boolean;
+  rateLimited?: boolean;
+  pendingSync?: boolean;
+  error?: string;
+  message?: string;
+  nextBatchDownloaded?: boolean;
+  batchImages?: string[];
+  batchNumber?: number;
+  batchAppliedCount?: number;
+}> {
   currentActiveAvatarUrl = url;
   try {
     await setSetting('current_profile_picture', url);
   } catch {}
 
-  // 1. Immediate Processing into 640x640 JPEG (Optimization)
   if (url !== lastProcessedUrl || !processedAvatarBuffer) {
     try {
-      console.log(`[AVATAR_PROCESS] Immediately processing new image: ${url.substring(0, 50)}...`);
-      const imageBuffer = await fetchImageBuffer(url);
-      let jimpInstance;
-      try {
-        jimpInstance = await Jimp.read(imageBuffer);
-      } catch (readErr) {
-        console.warn('Jimp decoding fallback to default JPEG...', readErr);
-        const fallbackBuf = await fetchImageBuffer(DEFAULT_AVATARS[0]);
-        jimpInstance = await Jimp.read(fallbackBuf);
-      }
-
-      const minDim = Math.min(jimpInstance.width, jimpInstance.height);
-      const startX = Math.floor((jimpInstance.width - minDim) / 2);
-      const startY = Math.floor((jimpInstance.height - minDim) / 2);
-
-      const cropped = jimpInstance.crop({ x: startX, y: startY, w: minDim, h: minDim });
-      const resized = cropped.resize({ w: 640, h: 640 });
-      processedAvatarBuffer = await resized.getBuffer('image/jpeg', { quality: 85 });
+      console.log(`[AVATAR_PROCESS] Decoding & optimizing image (any format -> 640x640 JPEG): ${url.substring(0, 60)}...`);
+      const imageBuffer = await fetchImageBuffer(url, false);
+      processedAvatarBuffer = await convertAnyImageBufferToJpeg640(imageBuffer);
       lastProcessedUrl = url;
-      console.log(`[AVATAR_PROCESS] Image processed and cached in memory.`);
-    } catch (processErr) {
-      console.error('[AVATAR_PROCESS] Error:', processErr);
-      return { success: false, error: 'Eroare la procesarea imaginii.' };
+      console.log(`[AVATAR_PROCESS] Image processed (${processedAvatarBuffer.length} bytes JPEG 640x640).`);
+    } catch (processErr: any) {
+      console.warn('[AVATAR_PROCESS] Primary decode error, trying safe fallback if remote:', processErr?.message || processErr);
+      try {
+        const fallbackBuf = await fetchImageBuffer(url, true);
+        processedAvatarBuffer = await convertAnyImageBufferToJpeg640(fallbackBuf);
+        lastProcessedUrl = url;
+      } catch {
+        return { success: false, error: 'Formatul imaginii nu a putut fi procesat.' };
+      }
     }
   }
 
   if (!waSocket || !isConnected) {
-    return { 
-      success: true, 
-      pendingSync: true, 
-      message: 'Imaginea a fost procesată și setată în profil! Se va aplica pe contul WhatsApp imediat după conectare.' 
+    return {
+      success: true,
+      pendingSync: true,
+      message: 'Imaginea a fost procesată și setată în profil! Se va aplica pe contul WhatsApp imediat după conectare.'
     };
   }
 
-  // 2. Reliability Check: If already synced, skip
   if (url === lastSyncedAvatarUrl) {
     return { success: true, message: 'Imaginea este deja actualizată pe WhatsApp.' };
   }
 
-  // 3. Safety cooldown to prevent WhatsApp server "rate-overlimit"
   const elapsed = Date.now() - lastAvatarUpdateTime;
   if (lastAvatarUpdateTime > 0 && elapsed < MIN_AVATAR_COOLDOWN_MS) {
     const remainingSec = Math.ceil((MIN_AVATAR_COOLDOWN_MS - elapsed) / 1000);
@@ -931,7 +1237,7 @@ async function performAvatarUpdate(url: string): Promise<{ success: boolean; rat
     const normalizedJid = jidNormalizedUser(rawUserJid);
 
     if (!processedAvatarBuffer) {
-       return { success: false, error: 'Imaginea nu a putut fi procesată.' };
+      return { success: false, error: 'Imaginea nu a putut fi procesată.' };
     }
 
     console.log(`[AVATAR_SYNC] Sending profile picture update to WhatsApp...`);
@@ -939,16 +1245,51 @@ async function performAvatarUpdate(url: string): Promise<{ success: boolean; rat
     lastAvatarUpdateTime = Date.now();
     lastSyncedAvatarUrl = url;
     addLog('system', 'System', 'Imaginea de profil a fost sincronizată cu succes pe contul WhatsApp!');
-    return { success: true, message: 'Imaginea de profil a fost actualizată cu succes pe WhatsApp!' };
+
+    if (autoAvatarBatch.includes(url)) {
+      if (!autoAvatarAppliedInBatch.includes(url)) {
+        autoAvatarAppliedInBatch.push(url);
+      }
+      const idxInBatch = autoAvatarBatch.indexOf(url);
+      if (idxInBatch >= autoAvatarBatchIndex) {
+        autoAvatarBatchIndex = idxInBatch + 1;
+      }
+    } else if (autoAvatarBatch.length > 0 && autoAvatarBatch[autoAvatarBatchIndex] === url) {
+      autoAvatarAppliedInBatch.push(url);
+      autoAvatarBatchIndex++;
+    }
+
+    let nextBatchDownloaded = false;
+    if (autoAvatarBatch.length > 0 && autoAvatarAppliedInBatch.length >= autoAvatarBatch.length) {
+      console.log(`[AUTO_AVATAR_BATCH] All ${autoAvatarBatch.length} photos in Lot #${autoAvatarPageOffset + 1} applied on WhatsApp! Downloading next 5 photos...`);
+      await ensureAutoAvatarBatch(true);
+      nextBatchDownloaded = true;
+      addLog(
+        'system',
+        'System',
+        `Toate cele 5 poze din lotul curent au apărut pe profilul WhatsApp! S-au descărcat automat alte 5 poze noi (Lot #${autoAvatarPageOffset + 1}) pentru tema "${aiSettings.autoAvatarQuery}".`
+      );
+    }
+
+    return {
+      success: true,
+      message: nextBatchDownloaded
+        ? `Poza a fost aplicată pe WhatsApp! Toate cele 5 din lot au fost folosite — s-a descărcat automat Lotul #${autoAvatarPageOffset + 1} (alte 5 poze noi)!`
+        : 'Imaginea de profil a fost actualizată cu succes pe WhatsApp!',
+      nextBatchDownloaded,
+      batchImages: [...autoAvatarBatch],
+      batchNumber: autoAvatarPageOffset + 1,
+      batchAppliedCount: autoAvatarAppliedInBatch.length,
+    };
   } catch (err: any) {
     const errMsg = err?.message || String(err);
     if (errMsg.includes('rate-overlimit') || errMsg.includes('overlimit')) {
       console.warn('WhatsApp profile picture update rate-overlimit hit. Backing off safely.');
-      lastAvatarUpdateTime = Date.now(); // Start cooldown so we don't spam WhatsApp
-      return { 
-        success: true, 
-        rateLimited: true, 
-        message: 'Imaginea este pregătită! WhatsApp solicită o scurtă pauză (rate-overlimit). Va fi sincronizată automat în curând.' 
+      lastAvatarUpdateTime = Date.now();
+      return {
+        success: true,
+        rateLimited: true,
+        message: 'Imaginea este pregătită! WhatsApp solicită o scurtă pauză (rate-overlimit). Va fi sincronizată automat în curând.'
       };
     }
     console.error('Avatar sync error:', err);
@@ -1398,6 +1739,7 @@ setInterval(async () => {
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', true);
   const PORT = Number(process.env.PORT) || 3000;
 
   // Global request logging & no-store headers for API routes
@@ -1506,6 +1848,10 @@ async function startServer() {
         currentAvatarUrl: currentActiveAvatarUrl,
         lastAvatarUpdated: lastAvatarUpdateTime ? new Date(lastAvatarUpdateTime).toISOString() : null,
         avatarCooldownRemaining: Math.max(0, Math.ceil((MIN_AVATAR_COOLDOWN_MS - (Date.now() - lastAvatarUpdateTime)) / 1000)),
+        avatarBatch: autoAvatarBatch,
+        avatarBatchApplied: autoAvatarAppliedInBatch,
+        avatarBatchNumber: autoAvatarPageOffset + 1,
+        avatarActiveThemeQuery: aiSettings.autoAvatarQuery,
         logs: messageLogs,
       });
     } catch (error) {
@@ -1536,7 +1882,6 @@ async function startServer() {
         return res.status(err?.statusCode || 500).json({ error: err.message || 'Eroare la generarea codului de asociere' });
       }
     } else {
-      // Switching to QR code: reset any unconfirmed pairing creds so QR handshake starts cleanly
       const hadPairingAttempt = !!currentPairingCode || !!pairingPhoneNumber;
       currentPairingCode = null;
       pairingPhoneNumber = null;
@@ -1578,7 +1923,6 @@ async function startServer() {
   app.post('/api/whatsapp/restart-session', async (req, res) => {
     try {
       addLog('system', 'System', 'Sesiune resetată complet. Se șterge starea locală, BACKUP-UL din Cloud și se inițializează un nou canal...');
-      // Clear Cloud Backup too
       await setSetting('baileys_creds_v2', '');
       await initBaileys(true);
       res.json({ success: true, message: 'Sesiune reinițializată' });
@@ -1598,7 +1942,7 @@ async function startServer() {
     }
   });
 
-  // Update profile picture on WhatsApp using Jimp & performAvatarUpdate
+  // Update profile picture on WhatsApp (accepts ANY image format, converts via sharp -> 640x640 JPEG)
   app.post('/api/whatsapp/update-avatar', async (req, res) => {
     const { avatarUrl } = req.body;
 
@@ -1609,12 +1953,16 @@ async function startServer() {
     try {
       const result = await performAvatarUpdate(avatarUrl);
       if (result.success) {
-        return res.json({ 
-          success: true, 
+        return res.json({
+          success: true,
           message: result.message || 'Imaginea de profil a fost actualizată pe WhatsApp!',
           rateLimited: !!result.rateLimited,
           pendingSync: !!result.pendingSync,
           avatarUrl: currentActiveAvatarUrl,
+          nextBatchDownloaded: !!result.nextBatchDownloaded,
+          batchImages: result.batchImages,
+          batchNumber: result.batchNumber,
+          batchAppliedCount: result.batchAppliedCount,
         });
       } else {
         return res.status(400).json({ success: false, error: result.error || 'Nu s-a putut actualiza imaginea de profil.' });
@@ -1625,19 +1973,23 @@ async function startServer() {
     }
   });
 
-  // Manual Trigger for Auto-Avatar (Testing / Next Image in Batch)
+  // Manual Trigger for Auto-Avatar (Next Image in 5-Image Batch)
   app.post('/api/whatsapp/trigger-auto-avatar', async (req, res) => {
     try {
       addLog('system', 'System', `Schimbare de avatar din lot declanșată (Tema: ${aiSettings.autoAvatarQuery})`);
       const url = await getNextAvatarFromBatch();
       if (url) {
         const result = await performAvatarUpdate(url);
-        return res.json({ 
-          success: true, 
-          message: result.message || 'Avatarul a fost schimbat cu succes cu următoarea imagine din lot!', 
+        return res.json({
+          success: true,
+          message: result.message || 'Avatarul a fost schimbat cu succes cu următoarea imagine din lot!',
           url,
           rateLimited: !!result.rateLimited,
           pendingSync: !!result.pendingSync,
+          nextBatchDownloaded: !!result.nextBatchDownloaded,
+          batchImages: result.batchImages || autoAvatarBatch,
+          batchNumber: result.batchNumber || (autoAvatarPageOffset + 1),
+          batchAppliedCount: result.batchAppliedCount ?? autoAvatarAppliedInBatch.length,
         });
       } else {
         return res.status(400).json({ success: false, error: 'Nu s-a putut găsi o imagine nouă în lot' });
@@ -1648,7 +2000,7 @@ async function startServer() {
     }
   });
 
-  // Multi-AI Ensemble Settings API ("Pentru răspunsuri pe WhatsApp să folosești toți AI")
+  // Multi-AI Ensemble Settings API
   app.get('/api/ai/settings', (req, res) => {
     res.json(aiSettings);
   });
@@ -1666,9 +2018,10 @@ async function startServer() {
     }
     if (autoAvatarQuery && typeof autoAvatarQuery === 'string') {
       if (aiSettings.autoAvatarQuery !== autoAvatarQuery) {
-        // Clear batch so new topic triggers fresh 5-image batch download
         autoAvatarBatch = [];
         autoAvatarBatchIndex = 0;
+        autoAvatarPageOffset = 0;
+        autoAvatarAppliedInBatch = [];
       }
       aiSettings.autoAvatarQuery = autoAvatarQuery;
     }
@@ -2088,23 +2441,145 @@ Proprietățile tale:
     }
   });
 
-  // Universal Image Search endpoint (Recognizes ANY query word, returns exactly 5 images)
+  // Universal Image Proxy: serves any external image format/site cleanly as JPEG so browser previews never break
+  app.get('/api/images/proxy', async (req, res) => {
+    const targetUrl = String(req.query.url || '').trim();
+    if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
+      return res.status(400).send('Invalid URL');
+    }
+    try {
+      const rawBuf = await fetchImageBuffer(targetUrl, false);
+      const jpegBuf = await convertAnyImageBufferToJpeg640(rawBuf);
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.send(jpegBuf);
+    } catch {
+      res.status(404).send('Image unavailable');
+    }
+  });
+
+  // Universal Image Converter: converts any uploaded format (HEIC, TIFF, AVIF, SVG, WebP, BMP, etc.) to 640x640 JPEG Data URL
+  app.post('/api/images/convert', async (req, res) => {
+    const rawInput = req.body?.imageData || req.body?.dataUrl;
+    if (!rawInput || typeof rawInput !== 'string') {
+      return res.status(400).json({ success: false, error: 'Datele imaginii lipsesc' });
+    }
+    try {
+      const rawBuf = await fetchImageBuffer(rawInput, false);
+      const jpegBuf = await convertAnyImageBufferToJpeg640(rawBuf);
+      const dataUrl = `data:image/jpeg;base64,${jpegBuf.toString('base64')}`;
+      res.json({ success: true, dataUrl });
+    } catch (err: any) {
+      res.status(400).json({ success: false, error: err?.message || 'Format imagine nesuportat' });
+    }
+  });
+
+  // Universal Image Search endpoint (Multi-site + ANY website URL + themes + batch sync)
   app.post('/api/ai/search-images', async (req, res) => {
-    const { query, offset: userOffset = 0 } = req.body;
-    if (!query || !query.trim()) return res.status(400).json({ error: 'Termenul de căutare este necesar' });
+    const { query, offset: userOffset = 0, excludeUrls = [], syncTheme = false } = req.body || {};
+    if (!query || !String(query).trim()) {
+      return res.status(400).json({ error: 'Termenul de căutare sau linkul este necesar' });
+    }
 
     try {
-      const cleanQuery = query.toLowerCase().trim();
-      const queryParam = encodeURIComponent(query.trim());
-      const pinterestSearchUrl = `https://www.pinterest.com/search/pins/?q=${queryParam}`;
+      const rawQuery = String(query).trim();
       const pageOffset = Math.max(0, Number(userOffset) || 0);
+      const excludeSet = new Set<string>(Array.isArray(excludeUrls) ? excludeUrls : []);
 
-      const results = await fetch5ImagesForQuery(cleanQuery, pageOffset);
+      const results = await fetch5ImagesForQuery(rawQuery, pageOffset, excludeSet);
 
-      res.json({ success: true, images: results, searchUrl: pinterestSearchUrl, offset: pageOffset });
+      if (syncTheme && !/^https?:\/\//i.test(rawQuery)) {
+        aiSettings.autoAvatarQuery = rawQuery;
+        lastAutoAvatarQuery = rawQuery;
+        autoAvatarPageOffset = pageOffset;
+        autoAvatarBatch = [...results];
+        autoAvatarBatchIndex = 0;
+        autoAvatarAppliedInBatch = [];
+        results.forEach((u) => autoAvatarSeenUrls.add(u));
+        setSetting('ai_settings', JSON.stringify(aiSettings)).catch(() => {});
+      } else if (syncTheme && /^https?:\/\//i.test(rawQuery)) {
+        autoAvatarBatch = [...results];
+        autoAvatarBatchIndex = 0;
+        autoAvatarAppliedInBatch = [];
+      }
+
+      res.json({
+        success: true,
+        images: results,
+        offset: pageOffset,
+        batchNumber: pageOffset + 1,
+        syncedTheme: syncTheme ? aiSettings.autoAvatarQuery : undefined,
+      });
     } catch (err: any) {
       console.error('Image search error:', err);
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Zrok Public Tunnel Management Routes (expose entire site via zrok.io)
+  app.get('/api/zrok/status', async (req, res) => {
+    try {
+      const status = await getZrokStatus();
+      res.json({ success: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Eroare status Zrok' });
+    }
+  });
+
+  app.post('/api/zrok/enable', async (req, res) => {
+    const { token, description } = req.body || {};
+    try {
+      const status = await enableZrok(token, description);
+      res.json({ success: true, ...status });
+    } catch (err: any) {
+      res.status(400).json({ success: false, error: err?.message || 'Activare Zrok eșuată' });
+    }
+  });
+
+  app.post('/api/zrok/start', async (req, res) => {
+    const { customName, basicAuth, autoStart, token } = req.body || {};
+    try {
+      const status = await startZrokTunnel(PORT, { customName, basicAuth, autoStart, token });
+      res.json({ success: true, ...status });
+    } catch (err: any) {
+      res.status(400).json({ success: false, error: err?.message || 'Pornire tunel Zrok eșuată' });
+    }
+  });
+
+  app.post('/api/zrok/stop', async (req, res) => {
+    try {
+      const status = await stopZrokTunnel();
+      res.json({ success: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Oprire tunel Zrok eșuată' });
+    }
+  });
+
+  app.post('/api/zrok/disable', async (req, res) => {
+    try {
+      const status = await disableZrok();
+      res.json({ success: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Dezactivare Zrok eșuată' });
+    }
+  });
+
+  app.post('/api/zrok/preferences', async (req, res) => {
+    const { customName, autoStart, basicAuth } = req.body || {};
+    try {
+      const status = await updateZrokPreferences({ customName, autoStart, basicAuth });
+      res.json({ success: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Salvare setări Zrok eșuată' });
+    }
+  });
+
+  app.post('/api/zrok/test', async (req, res) => {
+    try {
+      const report = await runZrokDiagnostics(PORT);
+      res.json(report);
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Test Zrok eșuat' });
     }
   });
 
@@ -2120,7 +2595,7 @@ Proprietățile tale:
   // Vite integration: mount asynchronously so port 3000 binds immediately for /api/*
   if (process.env.NODE_ENV !== 'production') {
     const vitePromise = createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, allowedHosts: true },
       appType: 'spa',
     });
     app.use((req, res, next) => {
@@ -2138,6 +2613,7 @@ Proprietățile tale:
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`WhatsOmni AI WhatsApp Server running on http://0.0.0.0:${PORT}`);
+    autoStartZrokIfConfigured(PORT).catch(() => {});
   });
 }
 
