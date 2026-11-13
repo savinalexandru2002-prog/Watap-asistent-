@@ -30,6 +30,10 @@ import {
   autoStartZrokIfConfigured,
   runZrokDiagnostics,
 } from './src/lib/zrokManager.ts';
+import {
+  generateWhatsAppVoiceNote,
+  generateWhatsAppVideoClip,
+} from './src/lib/mediaGenerator.ts';
 
 dotenv.config();
 
@@ -255,9 +259,13 @@ async function generateMultiAIReply(messageContent: string, senderName: string):
     for (let i = 0; i < modelsToTry.length; i++) {
       const item = modelsToTry[i];
       try {
+        const normPrompt = stripDiacritics(messageContent);
+        const mediaHint = /\b(video|videouri|clip|videoclip|filmulet|film|audio|vocal|vocale|vocala|voce|nota vocala|poza|imagine|foto)\b/i.test(normPrompt)
+          ? ' IMPORTANT: Sistemul atașează și trimite automat fișierul audio/video/imagine cerut împreună cu acest răspuns — NU spune că nu poți trimite audio, video sau poze; răspunde firesc prezentând sau comentând conținutul cerut.'
+          : '';
         const res = await ai.models.generateContent({
           model: item.id,
-          contents: `Mesaj WhatsApp primit de la ${senderName}: "${messageContent}". Răspunde concis (1-2 fraze) în limba română ca și cum ai fi tu însuți Alexandru care răspunde pe WhatsApp. Păstrează ideea mesajului. Fără etichete, fără să spui că ești bot.`,
+          contents: `Mesaj WhatsApp primit de la ${senderName}: "${messageContent}". Răspunde concis (1-2 fraze) în limba română ca și cum ai fi tu însuți Alexandru care răspunde pe WhatsApp. Păstrează ideea mesajului. Fără etichete, fără să spui că ești bot.${mediaHint}`,
           config: {
             systemInstruction: aiSettings.systemInstruction,
           },
@@ -299,65 +307,8 @@ async function generateMultiAIReply(messageContent: string, senderName: string):
   };
 }
 
-/**
- * TTS Audio Synthesizer: Generates MP3 audio buffer from text for WhatsApp Voice Notes (PTT)
- */
-async function generateTtsVoiceNoteBuffer(text: string): Promise<Buffer> {
-  const cleanText = text.replace(/[*_~`]/g, '').slice(0, 350).trim();
-  const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(cleanText)}&tl=ro&client=tw-ob`;
-  
-  const res = await fetch(ttsUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`TTS audio generation failed with HTTP status ${res.status}`);
-  }
-
-  const arrayBuf = await res.arrayBuffer();
-  return Buffer.from(arrayBuf);
-}
-
-/**
- * Curated HD Sample Videos for WhatsApp Video Messages
- */
-const SAMPLE_VIDEOS: Record<string, string[]> = {
-  cars: [
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4',
-  ],
-  nature: [
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
-  ],
-  tech: [
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyfixes.mp4',
-  ],
-  default: [
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4',
-  ],
-};
-
-function getSampleVideoForQuery(query: string): string {
-  const clean = query.toLowerCase();
-  if (clean.includes('masin') || clean.includes('mașin') || clean.includes('car') || clean.includes('auto') || clean.includes('bmw') || clean.includes('audi')) {
-    const list = SAMPLE_VIDEOS.cars;
-    return list[Math.floor(Math.random() * list.length)];
-  }
-  if (clean.includes('peisaj') || clean.includes('natur') || clean.includes('munte') || clean.includes('mare')) {
-    const list = SAMPLE_VIDEOS.nature;
-    return list[Math.floor(Math.random() * list.length)];
-  }
-  if (clean.includes('tech') || clean.includes('robot') || clean.includes('cod') || clean.includes('calculator')) {
-    const list = SAMPLE_VIDEOS.tech;
-    return list[Math.floor(Math.random() * list.length)];
-  }
-  const defaultList = SAMPLE_VIDEOS.default;
-  return defaultList[Math.floor(Math.random() * defaultList.length)];
+function stripDiacritics(str: string): string {
+  return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 }
 
 /**
@@ -374,6 +325,13 @@ async function fetchImageBuffer(avatarUrl: string, allowFallback: boolean = true
     return Buffer.from(decodeURIComponent(payload), 'utf-8');
   }
 
+  if (/picsum\.photos/i.test(avatarUrl)) {
+    if (!allowFallback) {
+      throw new Error('Sursa picsum.photos nu răspunde în acest mediu.');
+    }
+    avatarUrl = DEFAULT_AVATARS[Math.floor(Math.random() * DEFAULT_AVATARS.length)];
+  }
+
   const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
   let refererOrigin = 'https://www.google.com/';
   try {
@@ -388,7 +346,7 @@ async function fetchImageBuffer(avatarUrl: string, allowFallback: boolean = true
         'Referer': refererOrigin,
       },
       redirect: 'follow',
-      signal: AbortSignal.timeout(12000),
+      signal: AbortSignal.timeout(8000),
     });
 
     if (!fetchRes.ok) {
@@ -411,17 +369,29 @@ async function fetchImageBuffer(avatarUrl: string, allowFallback: boolean = true
     if (!allowFallback) {
       throw err;
     }
-    console.warn(`Primary image fetch failed for ${avatarUrl}, using fallback JPEG...`, err);
-    const fallbackUrl = DEFAULT_AVATARS[Math.floor(Math.random() * DEFAULT_AVATARS.length)];
-    const fallbackRes = await fetch(fallbackUrl, {
-      headers: {
-        'User-Agent': userAgent,
-        'Accept': 'image/*',
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-    const arrayBuf = await fallbackRes.arrayBuffer();
-    return Buffer.from(arrayBuf);
+    for (const fallbackUrl of DEFAULT_AVATARS) {
+      if (fallbackUrl === avatarUrl) continue;
+      try {
+        const fallbackRes = await fetch(fallbackUrl, {
+          headers: {
+            'User-Agent': userAgent,
+            'Accept': 'image/*',
+          },
+          signal: AbortSignal.timeout(6000),
+        });
+        if (fallbackRes.ok) {
+          const arrayBuf = await fallbackRes.arrayBuffer();
+          const buf = Buffer.from(arrayBuf);
+          if (buf.length >= 32) return buf;
+        }
+      } catch {}
+    }
+    // Offline/sandbox synthetic 640x640 JPEG fallback so image decoding never aborts
+    return await sharp({
+      create: { width: 640, height: 640, channels: 3, background: { r: 15, g: 23, b: 42 } },
+    })
+      .jpeg({ quality: 85 })
+      .toBuffer();
   }
 }
 
@@ -1089,22 +1059,27 @@ async function fetch5ImagesForQuery(
     '1522335789203-aabd1fc54bc9', '1509198397868-475647b2a1e5', '1518709268805-4e9042af9f23',
     '1579783902614-a3fb3927b675', '1514539079130-25950c84af65', '1607604276583-eef5d076aa5f',
     '1550745165-9bc0b252726f', '1511512578047-dfb367046420', '1503376780353-7e6692767b70',
+    '1544005313-94ddf0286df2', '1531746020798-e6953c6e8e04', '1524504388940-b1c1722653e1',
+    '1578632767115-351597cf2477', '1514565131-fce0801e5785', '1486406146926-c627a92ad1ab',
+    '1514888286974-6c03e2ca1dba', '1574158622682-e40e69881006', '1543466835-00a7907e9de1',
+    '1518770660439-4636190af475', '1526374965328-7f61d4dc18c5', '1563089145-599997674d42',
   ];
 
   let safetyLoop = 0;
-  while (verified.length < 5 && safetyLoop < 30) {
+  while (verified.length < 5 && safetyLoop < verifiedPhotoIds.length * 2) {
     safetyLoop++;
     const idx = (seedBase + safetyLoop) % verifiedPhotoIds.length;
     const url = `https://images.unsplash.com/photo-${verifiedPhotoIds[idx]}?w=640&auto=format&fit=crop&q=85&fm=jpg`;
     if (!verified.includes(url) && !excludeUrls.has(url)) {
       verified.push(url);
-    } else {
-      const fallbackId = 10 + ((seedBase + safetyLoop) * 13) % 400;
-      const picsumUrl = `https://picsum.photos/id/${fallbackId}/640/640.jpg`;
-      if (!verified.includes(picsumUrl) && !excludeUrls.has(picsumUrl)) {
-        verified.push(picsumUrl);
-      }
     }
+  }
+  // If excludeUrls covered all photos, fill remaining slots cleanly from Unsplash pool
+  let idxFill = 0;
+  while (verified.length < 5 && idxFill < verifiedPhotoIds.length) {
+    const url = `https://images.unsplash.com/photo-${verifiedPhotoIds[(seedBase + idxFill) % verifiedPhotoIds.length]}?w=640&auto=format&fit=crop&q=85&fm=jpg`;
+    if (!verified.includes(url)) verified.push(url);
+    idxFill++;
   }
 
   return verified.slice(0, 5);
@@ -1197,9 +1172,11 @@ async function performAvatarUpdate(url: string): Promise<{
       lastProcessedUrl = url;
       console.log(`[AVATAR_PROCESS] Image processed (${processedAvatarBuffer.length} bytes JPEG 640x640).`);
     } catch (processErr: any) {
-      console.warn('[AVATAR_PROCESS] Primary decode error, trying safe fallback if remote:', processErr?.message || processErr);
+      console.log(`[AVATAR_PROCESS] Remote image slow/unavailable (${processErr?.message || 'timeout'}), using verified fallback.`);
       try {
-        const fallbackBuf = await fetchImageBuffer(url, true);
+        const altCandidate =
+          autoAvatarBatch.find((u) => u !== url && !/picsum\.photos/i.test(u)) || DEFAULT_AVATARS[0];
+        const fallbackBuf = await fetchImageBuffer(altCandidate, true);
         processedAvatarBuffer = await convertAnyImageBufferToJpeg640(fallbackBuf);
         lastProcessedUrl = url;
       } catch {
@@ -1527,22 +1504,36 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
         // Skip bot's self-generated replies
         if (messageContent.startsWith('🤖 WhatsOmni AI')) continue;
 
-        const lowerContent = messageContent.toLowerCase();
-        
-        // Comprehensive mention detection for @Alexandru (case-insensitive, optional space, native tag)
-        const mentionsAlexandru = 
-          lowerContent.includes('@alexandru') || 
-          lowerContent.includes('@ alexandru') ||
-          /@\s*alexandru/i.test(messageContent) ||
-          /\b@alex(andru)?\b/i.test(messageContent);
+        const normalizedContent = stripDiacritics(messageContent);
 
-        // Also check if contextInfo has mentions (the native blue tags in WhatsApp)
+        // Comprehensive mention detection for @Alexandru (case-insensitive, optional space, native tag / LID)
+        const mentionsAlexandru =
+          normalizedContent.includes('@alexandru') ||
+          normalizedContent.includes('@ alexandru') ||
+          /@\s*alexandru/i.test(normalizedContent) ||
+          /@\s*alex\b/i.test(normalizedContent);
+
+        // Unwrap ephemeral / viewOnce / caption containers before checking contextInfo
+        const unwrappedMsg =
+          msg.message.ephemeralMessage?.message ||
+          msg.message.viewOnceMessage?.message ||
+          msg.message.viewOnceMessageV2?.message ||
+          msg.message.documentWithCaptionMessage?.message ||
+          msg.message;
+
         const contextInfo =
-          msg.message.extendedTextMessage?.contextInfo ||
-          msg.message.imageMessage?.contextInfo ||
-          msg.message.videoMessage?.contextInfo;
+          unwrappedMsg.extendedTextMessage?.contextInfo ||
+          unwrappedMsg.imageMessage?.contextInfo ||
+          unwrappedMsg.videoMessage?.contextInfo ||
+          unwrappedMsg.audioMessage?.contextInfo ||
+          unwrappedMsg.documentMessage?.contextInfo;
+
         const myJid = waSocket.user?.id ? jidNormalizedUser(waSocket.user.id) : '';
-        const mentionedMe = contextInfo?.mentionedJid?.includes(myJid);
+        const myLid = waSocket.user?.lid ? jidNormalizedUser(waSocket.user.lid) : '';
+        const mentionedJids: string[] = Array.isArray(contextInfo?.mentionedJid) ? contextInfo.mentionedJid : [];
+        const mentionedMe =
+          (Boolean(myJid) && mentionedJids.includes(myJid)) ||
+          (Boolean(myLid) && mentionedJids.includes(myLid));
 
         if (mentionsAlexandru || mentionedMe) {
           console.log(`Mention @Alexandru detected! (mentionsAlexandru: ${mentionsAlexandru}, mentionedMe: ${mentionedMe})`);
@@ -1564,46 +1555,103 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
 
           const { text: replyText, modelUsed } = await generateMultiAIReply(messageContent, senderName);
 
-          const isVoiceRequested = /\b(vocal|audio|voce|vocală|notă vocală|nota vocala|vorbește|vorbeste|spune vocal|mesaj vocal)\b/i.test(lowerContent);
-          const isVideoRequested = /\b(video|clip|videoclip|filmuleț|filmulet|filmat)\b/i.test(lowerContent);
-          const isImageRequested = /\b(poză|poza|imagine|foto|desenează|deseneaza)\b/i.test(lowerContent);
+          // Diacritic-normalized intent matching (Video priority > Audio PTT > Image > Text)
+          const isVideoRequested =
+            /\b(video|videouri|clip|clipuri|videoclip|videoclipuri|filmulet|filmulete|film|filmat|animatie|reel)\b/i.test(
+              normalizedContent
+            );
+          const isVoiceRequested =
+            /\b(vocal|vocale|vocala|audio|voce|nota vocala|mesaj vocal|mesaj audio|voice|ptt|vorbeste|spune vocal|citeste|zi vocal)\b/i.test(
+              normalizedContent
+            );
+          const isImageRequested =
+            /\b(poza|poze|imagine|imagini|foto|deseneaza|desen)\b/i.test(normalizedContent);
+
+          let finalMediaType: 'video' | 'audio' | 'image' | 'text' = 'text';
 
           try {
             let sent: any = null;
 
-            if (isVoiceRequested) {
-              console.log(`[WA_MEDIA] Generating Voice Note PTT audio for @Alexandru mention...`);
+            if (isVideoRequested) {
+              console.log(`[WA_MEDIA] Generating MP4 Video (H.264/AAC + voiceover) for @Alexandru mention...`);
               try {
-                const voiceBuf = await generateTtsVoiceNoteBuffer(replyText);
-                sent = await waSocket.sendMessage(senderJid, { 
-                  audio: voiceBuf, 
-                  mimetype: 'audio/mp4', 
-                  ptt: true // True WhatsApp Voice Note blue microphone waveform
-                }, { quoted: msg });
-                addLog('ai', `Alexia AI (Notă Vocală MP3 / PTT)`, `[Notă Vocală Trimisă]: "${replyText}"`);
-              } catch (ttsErr) {
+                const videoResult = await generateWhatsAppVideoClip({
+                  promptText: messageContent,
+                  replyText,
+                  aiClient: ai,
+                  fetchImages: (q) => fetch5ImagesForQuery(q),
+                  fetchImageBuffer: (u, allowFallback) => fetchImageBuffer(u, allowFallback),
+                });
+                sent = await waSocket.sendMessage(
+                  senderJid,
+                  {
+                    video: videoResult.buffer,
+                    mimetype: videoResult.mimetype,
+                    caption: replyText,
+                    jpegThumbnail: videoResult.jpegThumbnail,
+                    width: videoResult.width,
+                    height: videoResult.height,
+                  },
+                  { quoted: msg }
+                );
+                finalMediaType = 'video';
+                addLog(
+                  'ai',
+                  `Alexia AI (Video MP4 • ${videoResult.seconds}s)`,
+                  `[Video Trimis (${Math.round(videoResult.buffer.length / 1024)} KB)]: "${replyText}"`
+                );
+              } catch (vidErr: any) {
+                console.error('[WA_MEDIA] Video generation/send error, falling back to text:', vidErr);
+                sent = await waSocket.sendMessage(senderJid, { text: replyText }, { quoted: msg });
+                addLog('ai', `Alexia AI (${modelUsed})`, replyText);
+              }
+            } else if (isVoiceRequested) {
+              console.log(`[WA_MEDIA] Generating WhatsApp OGG/Opus PTT Voice Note for @Alexandru mention...`);
+              try {
+                const voiceResult = await generateWhatsAppVoiceNote(replyText, ai);
+                sent = await waSocket.sendMessage(
+                  senderJid,
+                  {
+                    audio: voiceResult.buffer,
+                    mimetype: voiceResult.mimetype,
+                    ptt: voiceResult.ptt,
+                    seconds: voiceResult.seconds,
+                  },
+                  { quoted: msg }
+                );
+                finalMediaType = 'audio';
+                addLog(
+                  'ai',
+                  `Alexia AI (Audio PTT • ${voiceResult.engine})`,
+                  `[Notă Vocală ${voiceResult.seconds}s Trimisă]: "${replyText}"`
+                );
+              } catch (ttsErr: any) {
                 console.warn('TTS voice note generation failed, falling back to text reply:', ttsErr);
                 sent = await waSocket.sendMessage(senderJid, { text: replyText }, { quoted: msg });
                 addLog('ai', `Alexia AI (${modelUsed})`, replyText);
               }
-            } else if (isVideoRequested) {
-              console.log(`[WA_MEDIA] Sending HD Video MP4 clip for @Alexandru mention...`);
-              const videoUrl = getSampleVideoForQuery(messageContent);
-              sent = await waSocket.sendMessage(senderJid, { 
-                video: { url: videoUrl }, 
-                mimetype: 'video/mp4', 
-                caption: replyText 
-              }, { quoted: msg });
-              addLog('ai', `Alexia AI (Video MP4)`, `[Video Clip Trimis]: "${replyText}"`);
             } else if (isImageRequested) {
-              console.log(`[WA_MEDIA] Sending Image for @Alexandru mention...`);
-              const imgList = await fetch5ImagesForQuery(messageContent);
-              const imgUrl = imgList[0];
-              sent = await waSocket.sendMessage(senderJid, { 
-                image: { url: imgUrl }, 
-                caption: replyText 
-              }, { quoted: msg });
-              addLog('ai', `Alexia AI (Imagine)`, `[Imagine Trimisă]: "${replyText}"`);
+              console.log(`[WA_MEDIA] Generating JPEG image reply for @Alexandru mention...`);
+              try {
+                const imgList = await fetch5ImagesForQuery(messageContent);
+                const imgBuf = await fetchImageBuffer(imgList[0], true);
+                const jpegImgBuf = await convertAnyImageBufferToJpeg640(imgBuf);
+                sent = await waSocket.sendMessage(
+                  senderJid,
+                  {
+                    image: jpegImgBuf,
+                    mimetype: 'image/jpeg',
+                    caption: replyText,
+                  },
+                  { quoted: msg }
+                );
+                finalMediaType = 'image';
+                addLog('ai', `Alexia AI (Imagine JPEG)`, `[Imagine Trimisă]: "${replyText}"`);
+              } catch (imgErr: any) {
+                console.warn('Image reply failed, falling back to text:', imgErr);
+                sent = await waSocket.sendMessage(senderJid, { text: replyText }, { quoted: msg });
+                addLog('ai', `Alexia AI (${modelUsed})`, replyText);
+              }
             } else {
               // Standard direct human text reply back as Alexandru
               sent = await waSocket.sendMessage(senderJid, { text: replyText }, { quoted: msg });
@@ -1622,7 +1670,14 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
             saveWaMessage({
               msgId: sent?.key?.id || `out_${Date.now()}`,
               sender: 'ai',
-              senderName: isVoiceRequested ? 'Alexandru (Notă Vocală PTT)' : isVideoRequested ? 'Alexandru (Video MP4)' : `Alexandru (${modelUsed})`,
+              senderName:
+                finalMediaType === 'audio'
+                  ? 'Alexandru (Notă Vocală PTT)'
+                  : finalMediaType === 'video'
+                  ? 'Alexandru (Video MP4)'
+                  : finalMediaType === 'image'
+                  ? 'Alexandru (Imagine)'
+                  : `Alexandru (${modelUsed})`,
               text: replyText,
               aiReply: replyText,
               modelUsed,
@@ -1670,9 +1725,13 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
 
   try {
     const savedAvatar = await getSetting('current_profile_picture');
-    if (savedAvatar) {
+    if (savedAvatar && !/picsum\.photos/i.test(savedAvatar)) {
       currentActiveAvatarUrl = savedAvatar;
       console.log('Loaded persistent profile picture from Cloud SQL');
+    } else if (savedAvatar && /picsum\.photos/i.test(savedAvatar)) {
+      currentActiveAvatarUrl = DEFAULT_AVATARS[0];
+      await setSetting('current_profile_picture', currentActiveAvatarUrl);
+      console.log('Migrated unreachable picsum.photos avatar URL to reliable Unsplash portrait.');
     }
   } catch (e) {
     console.warn('Could not load profile picture from Cloud SQL:', e);
@@ -1997,6 +2056,75 @@ async function startServer() {
     } catch (err: any) {
       console.error('Trigger auto-avatar route error:', err);
       return res.status(500).json({ success: false, error: err.message || 'Eroare internă' });
+    }
+  });
+
+  // Diagnostic / Test endpoint for @Alexandru Audio PTT & Video MP4 generation (and optional self-send on WhatsApp)
+  app.post('/api/whatsapp/test-media', async (req, res) => {
+    const { type = 'both', prompt = '@Alexandru mesaj audio si video cu pisici', sendToSelf = false } = req.body || {};
+    const targetJid = waSocket?.user?.id ? jidNormalizedUser(waSocket.user.id) : null;
+    const result: any = { success: true, isConnected, targetJid };
+
+    try {
+      const { text: replyText, modelUsed } = await generateMultiAIReply(prompt, 'Test Media');
+      result.replyText = replyText;
+      result.modelUsed = modelUsed;
+
+      if (type === 'audio' || type === 'both') {
+        const audio = await generateWhatsAppVoiceNote(replyText, ai);
+        result.audio = {
+          bytes: audio.buffer.length,
+          mimetype: audio.mimetype,
+          ptt: audio.ptt,
+          seconds: audio.seconds,
+          engine: audio.engine,
+        };
+        if (sendToSelf && isConnected && waSocket && targetJid) {
+          const sentAudio = await waSocket.sendMessage(targetJid, {
+            audio: audio.buffer,
+            mimetype: audio.mimetype,
+            ptt: audio.ptt,
+            seconds: audio.seconds,
+          });
+          if (sentAudio?.key?.id) botSentMessageIds.add(sentAudio.key.id);
+          result.audio.sentMessageId = sentAudio?.key?.id || null;
+        }
+      }
+
+      if (type === 'video' || type === 'both') {
+        const video = await generateWhatsAppVideoClip({
+          promptText: prompt,
+          replyText,
+          aiClient: ai,
+          fetchImages: (q) => fetch5ImagesForQuery(q),
+          fetchImageBuffer: (u, allowFallback) => fetchImageBuffer(u, allowFallback),
+        });
+        result.video = {
+          bytes: video.buffer.length,
+          mimetype: video.mimetype,
+          seconds: video.seconds,
+          width: video.width,
+          height: video.height,
+          thumbnailBytes: Buffer.from(video.jpegThumbnail, 'base64').length,
+          engine: video.engine,
+        };
+        if (sendToSelf && isConnected && waSocket && targetJid) {
+          const sentVideo = await waSocket.sendMessage(targetJid, {
+            video: video.buffer,
+            mimetype: video.mimetype,
+            caption: replyText,
+            jpegThumbnail: video.jpegThumbnail,
+            width: video.width,
+            height: video.height,
+          });
+          if (sentVideo?.key?.id) botSentMessageIds.add(sentVideo.key.id);
+          result.video.sentMessageId = sentVideo?.key?.id || null;
+        }
+      }
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Eroare test media' });
     }
   });
 

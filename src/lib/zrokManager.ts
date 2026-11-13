@@ -483,7 +483,33 @@ export async function startZrokTunnel(
           clearTimers();
           try {
             pushZrokLog(`Se eliberează automat sesiunea Zrok veche (${staleShareToken}) și se reîncearcă...`);
-            await execZrok(['delete', 'share', staleShareToken], 10000);
+            let released = false;
+            try {
+              await execZrok(['delete', 'share', staleShareToken], 10000);
+              released = true;
+            } catch (delErr: any) {
+              const delMsg = delErr?.message || '';
+              if (!/404|not found/i.test(delMsg)) {
+                throw delErr;
+              }
+            }
+
+            // If share belonged to a previous expired container environment (404 on current env),
+            // reset the custom name or fall back to an ephemeral zrok URL so tunnel always goes live.
+            if (!released && cleanCustomName) {
+              try {
+                await execZrok(['delete', 'name', cleanCustomName, '-n', 'public'], 10000);
+                await execZrok(['create', 'name', cleanCustomName, '-n', 'public'], 10000);
+              } catch {
+                // Drop -n public:<customName> on fallback retry so site still goes live on Zrok
+                const nIdx = args.indexOf('-n');
+                if (nIdx !== -1) {
+                  args.splice(nIdx, 2);
+                  pushZrokLog(`Numele "${cleanCustomName}" este blocat în altă sesiune; se pornește cu adresă Zrok nouă...`);
+                }
+              }
+            }
+
             const retryResult = await spawnOnce(false);
             resolve(retryResult);
           } catch (retryErr: any) {
