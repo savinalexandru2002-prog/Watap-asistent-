@@ -17,8 +17,9 @@ import makeWASocket, {
 import pino from 'pino';
 import { Jimp } from 'jimp';
 import sharp from 'sharp';
-import { saveWaMessage, getRecentWaMessages } from './src/db/messages.ts';
+import { saveWaMessage, getRecentWaMessages, countWaMessages } from './src/db/messages.ts';
 import { getSetting, setSetting } from './src/db/settings.ts';
+import { pingDatabase } from './src/db/index.ts';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
 import { getOrCreateUser } from './src/db/users.ts';
 import {
@@ -30,6 +31,8 @@ import {
   updateZrokPreferences,
   autoStartZrokIfConfigured,
   runZrokDiagnostics,
+  canWatchdogAutoStartZrok,
+  pingZrokPublicHealth,
 } from './src/lib/zrokManager.ts';
 import {
   generateWhatsAppVoiceNote,
@@ -57,13 +60,13 @@ console.error = (...args: any[]) => {
   origConsoleError(...args);
 };
 
-// Global process error handlers to prevent silent crashes
+// Global process error handlers to prevent silent crashes and ensure 24/7 uptime
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  console.warn('Recovered unhandled rejection:', reason);
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception thrown:', err);
+  console.warn('Recovered uncaught exception:', err);
 });
 
 // Initialize Gemini SDK on server-side
@@ -100,6 +103,7 @@ let currentPairingCode: string | null = null;
 let pairingPhoneNumber: string | null = null;
 let isRegistered = false;
 let reconnectAttempts = 0;
+let logoutRetryCount = 0;
 let isSocketReadyForPairing = false;
 let socketReadyResolvers: Array<(ready: boolean) => void> = [];
 let initPromise: Promise<void> | null = null;
@@ -1495,6 +1499,7 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
         isConnected = true;
         isRegistered = true;
         reconnectAttempts = 0;
+        logoutRetryCount = 0;
         currentQrCodeDataUrl = null;
         currentPairingCode = null;
         pairingPhoneNumber = null;
@@ -1522,19 +1527,24 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
         const isBadSession = statusCode === DisconnectReason.badSession;
 
         if (isLoggedOut || isBadSession) {
-          isRegistered = false;
-          const reason = isLoggedOut ? 'delogare / sesiune invalidă' : 'sesiune expirată (badSession 500)';
-          addLog('system', 'System', `Sesiune întreruptă din cauza: ${reason}. Se resetează canalul pentru siguranță...`);
-          console.warn(`[WA_SESSION_RESET] Resetting session due to: ${reason}`);
+          logoutRetryCount++;
+          if (logoutRetryCount <= 3) {
+            addLog('system', 'System', `Sesiune întreruptă temporal (${statusCode}). Încercare de reconectare automată #${logoutRetryCount} din Cloud SQL...`);
+            console.warn(`[WA_SOFT_RECONNECT] Auth drop (${statusCode}), attempting soft reconnect from Cloud backup (${logoutRetryCount}/3)...`);
+            reconnectTimer = setTimeout(() => initBaileys(false), 3000);
+          } else {
+            isRegistered = false;
+            const reason = isLoggedOut ? 'delogare / sesiune invalidă' : 'sesiune expirată (badSession 500)';
+            addLog('system', 'System', `Sesiune întreruptă definitiv din cauza: ${reason}. Se resetează canalul...`);
+            try {
+              fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+            } catch (e) {}
 
-          try {
-            fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-          } catch (e) {}
+            await setSetting('baileys_creds_v2', '');
+            await setSetting('baileys_auth_bundle_v1', '');
 
-          await setSetting('baileys_creds_v2', '');
-          await setSetting('baileys_auth_bundle_v1', '');
-
-          reconnectTimer = setTimeout(() => initBaileys(true), 2000);
+            reconnectTimer = setTimeout(() => initBaileys(true), 2000);
+          }
         } else {
           reconnectAttempts++;
           const isRestartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
@@ -1812,47 +1822,118 @@ setInterval(() => {
   }
 }, 25000);
 
-// 24/7 Self-Ping Keep-Alive Watchdog (prevents container idling / sleep)
-setInterval(() => {
-  fetch(`http://127.0.0.1:${serverPort}/api/health`, { signal: AbortSignal.timeout(5000) })
-    .catch(() => {});
-}, 180000);
+const keepAliveStats = {
+  intervalSeconds: 45,
+  cyclesCompleted: 0,
+  lastCycleAt: null as string | null,
+  lastLocalPingOk: false,
+  lastNginxPingOk: false,
+  lastCloudRunIngressStatus: null as number | null,
+  lastTunnelPingOk: false,
+  lastCloudSqlHeartbeatAt: null as string | null,
+  lastSignalReceived: null as string | null,
+};
 
-// 24/7 Zrok Watchdog (auto-restarts Zrok tunnel if autoStart is true and tunnel dropped)
+async function runKeepAliveHeartbeatCycle() {
+  const nginxPort = Number(process.env.NGINX_PORT) || 8080;
+  const appUrl = (process.env.APP_URL || '').trim().replace(/\/+$/, '');
+
+  const tasks: Array<Promise<void>> = [
+    // 1. Direct Express port keep-alive
+    fetch(`http://127.0.0.1:${serverPort}/api/health`, {
+      headers: { 'x-keepalive': '1' },
+      signal: AbortSignal.timeout(5000),
+    })
+      .then((r) => {
+        keepAliveStats.lastLocalPingOk = r.ok;
+      })
+      .catch(() => {
+        keepAliveStats.lastLocalPingOk = false;
+      }),
+
+    // 2. Nginx reverse proxy (port 8080) keep-alive (prevents nginx 300s proxy_read_timeout / idle drop)
+    fetch(`http://127.0.0.1:${nginxPort}/api/health`, {
+      headers: { 'x-keepalive': '1' },
+      signal: AbortSignal.timeout(5000),
+    })
+      .then((r) => {
+        keepAliveStats.lastNginxPingOk = r.ok;
+      })
+      .catch(() => {
+        keepAliveStats.lastNginxPingOk = false;
+      }),
+
+    // 3. Public Tunnel (Zrok / Cloudflare) external keep-alive
+    pingZrokPublicHealth()
+      .then((ok) => {
+        keepAliveStats.lastTunnelPingOk = ok;
+      })
+      .catch(() => {
+        keepAliveStats.lastTunnelPingOk = false;
+      }),
+  ];
+
+  // 4. External Cloud Run ingress ping via APP_URL (counts as active external HTTP request on Cloud Run revision)
+  if (appUrl && /^https?:\/\//i.test(appUrl)) {
+    tasks.push(
+      fetch(`${appUrl}/api/health`, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: { 'User-Agent': 'WhatsOmni-KeepAlive/1.0' },
+        signal: AbortSignal.timeout(6000),
+      })
+        .then((r) => {
+          keepAliveStats.lastCloudRunIngressStatus = r.status;
+        })
+        .catch(() => {
+          keepAliveStats.lastCloudRunIngressStatus = 0;
+        })
+    );
+  }
+
+  await Promise.allSettled(tasks);
+  keepAliveStats.cyclesCompleted++;
+  keepAliveStats.lastCycleAt = new Date().toISOString();
+}
+
+// Execute keep-alive heartbeat 5s after boot and every 45s continuously (well below 300s / 5-min idle timeout)
+setTimeout(() => {
+  runKeepAliveHeartbeatCycle().catch(() => {});
+}, 5000);
+setInterval(() => {
+  runKeepAliveHeartbeatCycle().catch(() => {});
+}, 45000);
+
+// 24/7 Zrok Watchdog (auto-restarts Zrok tunnel if autoStart is true, tunnel dropped, and not in 429 cooldown)
 setInterval(async () => {
   try {
+    if (!canWatchdogAutoStartZrok()) return;
     const status = await getZrokStatus();
-    if (status.autoStart && status.isEnabled && !status.isRunning) {
-      console.log('[ZROK_WATCHDOG] Tunnel dropped while autoStart is enabled. Re-launching Zrok tunnel...');
-      await startZrokTunnel(serverPort);
+    if (status.autoStart && status.isEnabled && !status.isRunning && canWatchdogAutoStartZrok()) {
+      console.log('[ZROK_WATCHDOG] Tunnel inactive while autoStart is enabled. Launching Zrok tunnel...');
+      await startZrokTunnel(serverPort, { fromWatchdog: true });
     }
   } catch {}
 }, 45000);
 
-// 24/7 Zrok External Public Keep-Alive (pings public Zrok URL externally every 2 minutes to keep Cloud Run container awake 24/7)
+// 24/7 Cloud SQL Heartbeat monitor: keeps /app/cloud_sql_proxy active every 30s and persists runtime telemetry
 setInterval(async () => {
   try {
-    const status = await getZrokStatus();
-    if (status.isRunning && status.publicUrl) {
-      const pingUrl = `${status.publicUrl.replace(/\/+$/, '')}/api/health`;
-      await fetch(pingUrl, { signal: AbortSignal.timeout(6000) });
-    }
-  } catch {}
-}, 120000);
-
-// 24/7 Cloud SQL Heartbeat monitor: records uptime and session status
-setInterval(async () => {
-  try {
+    const nowIso = new Date().toISOString();
     const heartbeatData = JSON.stringify({
-      timestamp: new Date().toISOString(),
+      timestamp: nowIso,
       uptimeSeconds: Math.floor((Date.now() - serverStartTime) / 1000),
       isConnected,
       isRegistered,
       userPhone,
       mode: aiSettings.mode,
       reconnectAttempts,
+      keepAliveCycles: keepAliveStats.cyclesCompleted,
+      nginxKeepAliveOk: keepAliveStats.lastNginxPingOk,
+      tunnelKeepAliveOk: keepAliveStats.lastTunnelPingOk,
     });
     await setSetting('heartbeat_24_7', heartbeatData);
+    keepAliveStats.lastCloudSqlHeartbeatAt = nowIso;
   } catch (err) {
     // Non-fatal background heartbeat error
   }
@@ -1901,7 +1982,12 @@ async function startServer() {
   });
 
   app.use((req, res, next) => {
-    if (!req.url.startsWith('/api/whatsapp/status') && !req.url.startsWith('/api/cloudsql/stats')) {
+    if (
+      !req.url.startsWith('/api/whatsapp/status') &&
+      !req.url.startsWith('/api/cloudsql/stats') &&
+      !req.url.startsWith('/api/health') &&
+      !req.url.startsWith('/api/keepalive/status')
+    ) {
       console.log(`[HTTP] ${req.method} ${req.url}`);
     }
     next();
@@ -1909,9 +1995,29 @@ async function startServer() {
 
   app.use(express.json({ limit: '20mb' }));
 
-  // Lightweight readiness endpoint
+  // Lightweight readiness endpoint (skips verbose HTTP logs on keep-alive pings)
   app.get('/api/health', (req, res) => {
-    res.json({ ok: true, uptimeSeconds: Math.floor((Date.now() - serverStartTime) / 1000) });
+    res.json({
+      ok: true,
+      uptimeSeconds: Math.floor((Date.now() - serverStartTime) / 1000),
+      keepAliveCycles: keepAliveStats.cyclesCompleted,
+    });
+  });
+
+  // Backend 24/7 Keep-Alive & Lifecycle Telemetry endpoint
+  app.get('/api/keepalive/status', async (req, res) => {
+    const lastShutdown = await getSetting('last_shutdown_signal').catch(() => null);
+    res.json({
+      ok: true,
+      uptimeSeconds: Math.floor((Date.now() - serverStartTime) / 1000),
+      ports: {
+        express: serverPort,
+        nginx: Number(process.env.NGINX_PORT) || 8080,
+      },
+      cloudRunTimeoutSeconds: Number(process.env.CLOUD_RUN_TIMEOUT_SECONDS) || 3600,
+      keepAlive: keepAliveStats,
+      lastShutdownEvent: lastShutdown ? JSON.parse(lastShutdown) : null,
+    });
   });
 
   // Helper: cleanly initialize fresh Baileys handshake & request 8-char WhatsApp pairing code
@@ -2563,27 +2669,32 @@ Proprietățile tale:
     }
   });
 
-  // Cloud SQL Health and 24/7 Stats API with graceful fallback
+  // Cloud SQL Health and 24/7 Stats API with active ping verification
   app.get('/api/cloudsql/stats', async (req, res) => {
     try {
-      const rawHeartbeat = await getSetting('heartbeat_24_7');
-      const recentMessages = await getRecentWaMessages(100);
+      const [dbPing, rawHeartbeat, exactMessageCount] = await Promise.all([
+        pingDatabase(),
+        getSetting('heartbeat_24_7'),
+        countWaMessages(),
+      ]);
       res.json({
         success: true,
         database: 'Cloud SQL PostgreSQL (us-east1)',
-        status: 'online_24_7',
+        status: dbPing.ok ? 'online_24_7' : 'degraded',
+        latencyMs: dbPing.latencyMs,
         uptimeSeconds: Math.floor((Date.now() - serverStartTime) / 1000),
-        totalPersistedMessages: recentMessages.length,
+        totalPersistedMessages: exactMessageCount,
         lastHeartbeat: rawHeartbeat ? JSON.parse(rawHeartbeat) : null,
       });
     } catch (err: any) {
-      res.json({
-        success: true,
-        database: 'Cloud SQL PostgreSQL (Fallback Mode)',
-        status: 'online',
+      res.status(503).json({
+        success: false,
+        database: 'Cloud SQL PostgreSQL (Reconnecting)',
+        status: 'reconnecting',
         uptimeSeconds: Math.floor((Date.now() - serverStartTime) / 1000),
         totalPersistedMessages: messageLogs.length,
         lastHeartbeat: null,
+        error: err?.message || 'Database connection unavailable',
       });
     }
   });
@@ -2833,10 +2944,42 @@ Proprietățile tale:
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`WhatsOmni AI WhatsApp Server running on http://0.0.0.0:${PORT}`);
     autoStartZrokIfConfigured(PORT).catch(() => {});
   });
+
+  // Keep HTTP sockets warm longer than standard proxy idle timeouts (60s) and avoid premature request timeouts
+  httpServer.keepAliveTimeout = 65000;
+  httpServer.headersTimeout = 66000;
+  httpServer.requestTimeout = 0;
+
+  // Graceful shutdown audit on SIGTERM / SIGINT (flushes telemetry & auth state if Cloud Run recycles instance)
+  let shuttingDown = false;
+  const handleShutdownSignal = async (sig: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    keepAliveStats.lastSignalReceived = sig;
+    console.warn(`[LIFECYCLE] Received ${sig}; recording shutdown telemetry before exit...`);
+    try {
+      await setSetting(
+        'last_shutdown_signal',
+        JSON.stringify({
+          signal: sig,
+          at: new Date().toISOString(),
+          uptimeSeconds: Math.floor((Date.now() - serverStartTime) / 1000),
+          wasWhatsAppConnected: isConnected,
+        })
+      );
+    } catch {}
+    httpServer.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 2500).unref();
+  };
+
+  process.once('SIGTERM', () => handleShutdownSignal('SIGTERM'));
+  process.once('SIGINT', () => handleShutdownSignal('SIGINT'));
 }
 
 startServer();

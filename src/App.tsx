@@ -86,6 +86,8 @@ interface ZrokStatus {
   isEnabled: boolean;
   isRunning: boolean;
   publicUrl: string | null;
+  tunnelProvider?: 'zrok' | 'cloudflare' | null;
+  fallbackNotice?: string | null;
   customName: string;
   autoStart: boolean;
   hasToken: boolean;
@@ -3288,7 +3290,9 @@ export default function App() {
                   }`} />
                   <span>
                     {zrokStatus?.isRunning && zrokStatus?.publicUrl
-                      ? 'LIVE PE ZROK'
+                      ? zrokStatus.tunnelProvider === 'cloudflare'
+                        ? 'LIVE (BACKUP CLOUDFLARE)'
+                        : 'LIVE PE ZROK'
                       : zrokStatus?.isEnabled
                       ? 'ZROK ACTIVAT (OPRIT)'
                       : 'NECESITĂ TOKEN ZROK'}
@@ -3301,7 +3305,9 @@ export default function App() {
                 <div className="p-5 bg-emerald-950/30 border border-emerald-600/40 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                   <div className="space-y-1 min-w-0">
                     <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400">
-                      Link-ul Public al Site-ului prin Zrok:
+                      {zrokStatus.tunnelProvider === 'cloudflare'
+                        ? 'Link-ul Public LIVE 24/7 (Cloudflare Backup activ automat):'
+                        : 'Link-ul Public al Site-ului prin Zrok:'}
                     </span>
                     <div className="font-mono text-sm md:text-base font-bold text-white truncate">
                       {zrokStatus.publicUrl}
@@ -3515,7 +3521,14 @@ export default function App() {
                 </div>
               )}
 
-              {/* Error & Logs Console */}
+              {/* Fallback Info / Error & Logs Console */}
+              {zrokStatus?.fallbackNotice && (
+                <div className="p-3.5 bg-amber-950/40 border border-amber-600/40 rounded-xl text-xs text-amber-200 flex items-center gap-2">
+                  <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>{zrokStatus.fallbackNotice}</span>
+                </div>
+              )}
+
               {zrokStatus?.error && (
                 <div className="p-3.5 bg-red-950/50 border border-red-700/50 rounded-xl text-xs text-red-200 flex items-center gap-2">
                   <ShieldAlert className="w-4 h-4 text-red-400 shrink-0" />

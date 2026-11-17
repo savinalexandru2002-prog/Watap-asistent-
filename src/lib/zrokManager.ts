@@ -1,4 +1,5 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
+import https from 'https';
 import path from 'path';
 import fs from 'fs';
 import { getSetting, setSetting } from '../db/settings.ts';
@@ -9,7 +10,10 @@ const ZROK_BIN_PATH = path.resolve(BIN_DIR, 'zrok2');
 const ZROK_HOME_DIR = path.resolve(ROOT_DIR, '.zrok_data');
 const ZROK_ENV_DESC = 'WhatsOmni-AI-Cloud';
 const ZROK_DOWNLOAD_URL =
-  'https://github.com/openziti/zrok/releases/download/v2.0.9/zrok_2.0.9_linux_amd64.tar.gz';
+  'https://github.com/openziti/zrok/releases/download/v2.0.10/zrok_2.0.10_linux_amd64.tar.gz';
+const CLOUDFLARED_BIN_PATH = path.resolve(BIN_DIR, 'cloudflared');
+const CLOUDFLARED_DOWNLOAD_URL =
+  'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
 
 export interface ZrokSettings {
   token: string;
@@ -25,6 +29,8 @@ export interface ZrokStatusSnapshot {
   isEnabled: boolean;
   isRunning: boolean;
   publicUrl: string | null;
+  tunnelProvider: 'zrok' | 'cloudflare' | null;
+  fallbackNotice: string | null;
   customName: string;
   autoStart: boolean;
   hasToken: boolean;
@@ -60,8 +66,11 @@ interface OverviewData {
 }
 
 let zrokProcess: ChildProcess | null = null;
+let cloudflaredProcess: ChildProcess | null = null;
 let zrokRunning = false;
 let zrokPublicUrl: string | null = null;
+let activeTunnelProvider: 'zrok' | 'cloudflare' | null = null;
+let zrokFallbackNotice: string | null = null;
 let zrokLastError: string | null = null;
 let zrokLogs: string[] = [];
 let zrokVersionCache: string | null = null;
@@ -75,6 +84,218 @@ let zrokSettingsCache: ZrokSettings = {
 let settingsLoaded = false;
 let hooksRegistered = false;
 let syncInFlight: Promise<void> | null = null;
+let startInFlight: Promise<ZrokStatusSnapshot> | null = null;
+let zrokBackoffAttempts = 0;
+let zrokRetryAfterMs = 0;
+
+function getZrokBasicAuthHeader(basicAuth?: string): Record<string, string> {
+  const val = (basicAuth || '').trim();
+  const colonIdx = val.indexOf(':');
+  if (colonIdx > 0 && colonIdx < val.length - 1) {
+    return { Authorization: `Basic ${Buffer.from(val, 'utf8').toString('base64')}` };
+  }
+  return {};
+}
+
+export function canWatchdogAutoStartZrok(): boolean {
+  if (zrokRunning || zrokProcess || cloudflaredProcess || startInFlight) return false;
+  return Date.now() >= zrokRetryAfterMs;
+}
+
+async function fetchPublicTunnelHealth(
+  normalizedUrl: string,
+  extraHeaders: Record<string, string> = {}
+): Promise<{ ok: boolean; status: number; body: any }> {
+  try {
+    const res = await fetch(`${normalizedUrl}/api/health`, {
+      headers: extraHeaders,
+      signal: AbortSignal.timeout(6000),
+    });
+    const body = await res.json().catch(() => ({}));
+    return { ok: res.ok && body?.ok === true, status: res.status, body };
+  } catch (directErr) {
+    // Container metadata DNS (169.254.169.254) can cache negative NXDOMAIN on brand-new *.trycloudflare.com hosts;
+    // fall back to Cloudflare DoH A-record lookup while keeping full TLS SNI verification.
+    const parsed = new URL(normalizedUrl);
+    const hostname = parsed.hostname;
+    const dohRes = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=A`,
+      { headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(5000) }
+    );
+    if (!dohRes.ok) throw directErr;
+    const dohJson: any = await dohRes.json();
+    const aRecord = Array.isArray(dohJson?.Answer)
+      ? dohJson.Answer.find((a: any) => a?.type === 1 && typeof a?.data === 'string')?.data
+      : null;
+    if (!aRecord) throw directErr;
+
+    return await new Promise((resolve, reject) => {
+      const req = https.request(
+        {
+          host: aRecord,
+          port: 443,
+          servername: hostname,
+          path: '/api/health',
+          method: 'GET',
+          headers: {
+            Host: hostname,
+            ...extraHeaders,
+          },
+          timeout: 7000,
+        },
+        (res) => {
+          let raw = '';
+          res.on('data', (chunk) => {
+            raw += chunk.toString();
+          });
+          res.on('end', () => {
+            let body: any = {};
+            try {
+              body = JSON.parse(raw);
+            } catch {}
+            const status = res.statusCode || 0;
+            resolve({ ok: status >= 200 && status < 300 && body?.ok === true, status, body });
+          });
+        }
+      );
+      req.on('timeout', () => {
+        req.destroy(new Error('TLS health check timeout'));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+}
+
+export async function pingZrokPublicHealth(): Promise<boolean> {
+  if (!zrokRunning || !zrokPublicUrl) return false;
+  const settings = await loadZrokSettings();
+  const normalizedUrl = normalizeZrokUrl(zrokPublicUrl);
+  try {
+    const res = await fetchPublicTunnelHealth(
+      normalizedUrl,
+      activeTunnelProvider === 'zrok' ? getZrokBasicAuthHeader(settings.basicAuth) : {}
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureCloudflaredBinary(): Promise<void> {
+  if (fs.existsSync(CLOUDFLARED_BIN_PATH)) return;
+  if (!fs.existsSync(BIN_DIR)) {
+    fs.mkdirSync(BIN_DIR, { recursive: true });
+  }
+  pushZrokLog('Se instalează motorul de rezervă Cloudflare Tunnel (cloudflared)...');
+  const res = await fetch(CLOUDFLARED_DOWNLOAD_URL, { redirect: 'follow', signal: AbortSignal.timeout(45000) });
+  if (!res.ok) {
+    throw new Error(`Descărcarea cloudflared a eșuat: HTTP ${res.status}`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  fs.writeFileSync(CLOUDFLARED_BIN_PATH, buf);
+  fs.chmodSync(CLOUDFLARED_BIN_PATH, 0o755);
+  pushZrokLog('Motorul de rezervă Cloudflare Tunnel a fost instalat.');
+}
+
+async function startCloudflareFallbackTunnel(port: number, reason: string): Promise<ZrokStatusSnapshot> {
+  await stopTunnelProcessOnly();
+  await ensureCloudflaredBinary();
+  registerZrokShutdownHooks();
+
+  pushZrokLog('Se pornește tunelul HTTPS de rezervă (Cloudflare Quick Tunnel, fără limită 429)...');
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const proc = spawn(
+      CLOUDFLARED_BIN_PATH,
+      ['tunnel', '--url', `http://127.0.0.1:${port}`, '--protocol', 'http2', '--no-autoupdate'],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+
+    cloudflaredProcess = proc;
+    zrokRunning = true;
+    activeTunnelProvider = 'cloudflare';
+    zrokPublicUrl = null;
+    zrokLastError = null;
+    zrokFallbackNotice = reason;
+
+    const clearTimer = () => clearTimeout(startupTimer);
+
+    const handleChunk = (data: Buffer) => {
+      const text = data.toString();
+      const lines = text.split(/\r?\n/);
+      for (const line of lines) {
+        const clean = line.trim();
+        if (!clean) continue;
+        const match = clean.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/i);
+        if (match?.[0] && !settled) {
+          const cfUrl = match[0].replace(/\/+$/, '');
+          settled = true;
+          clearTimer();
+          zrokPublicUrl = cfUrl;
+          zrokRunning = true;
+          activeTunnelProvider = 'cloudflare';
+          zrokLastError = null;
+          pushZrokLog(`[FAILOVER_LIVE] Tunelul de rezervă Cloudflare este LIVE 24/7 la: ${cfUrl}`);
+          saveZrokSettings({ lastPublicUrl: cfUrl })
+            .catch(() => {})
+            .finally(async () => {
+              // Give Cloudflare edge DNS ~2s to propagate before returning LIVE
+              await new Promise((r) => setTimeout(r, 2000));
+              resolve(await buildStatusSnapshot());
+            });
+          return;
+        }
+        if (/ERR|failed|registered tunnel connection/i.test(clean)) {
+          pushZrokLog(`[CF] ${clean.slice(0, 180)}`);
+        }
+      }
+    };
+
+    proc.stdout?.on('data', handleChunk);
+    proc.stderr?.on('data', handleChunk);
+
+    proc.on('error', (err) => {
+      if (cloudflaredProcess === proc) {
+        cloudflaredProcess = null;
+        zrokRunning = false;
+        zrokPublicUrl = null;
+        activeTunnelProvider = null;
+      }
+      if (!settled) {
+        settled = true;
+        clearTimer();
+        reject(err);
+      }
+    });
+
+    proc.on('exit', (code, signal) => {
+      if (cloudflaredProcess === proc) {
+        cloudflaredProcess = null;
+        zrokRunning = false;
+        zrokPublicUrl = null;
+        activeTunnelProvider = null;
+      }
+      pushZrokLog(`Tunelul Cloudflare oprit (cod=${code ?? 'null'}, signal=${signal ?? 'none'}).`);
+      if (!settled) {
+        settled = true;
+        clearTimer();
+        reject(new Error(`Cloudflare Tunnel s-a oprit neașteptat (cod ${code ?? 'unknown'}).`));
+      }
+    });
+
+    const startupTimer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try {
+          proc.kill('SIGTERM');
+        } catch {}
+        reject(new Error('Timeout la pornirea tunelului de rezervă Cloudflare (20s).'));
+      }
+    }, 20000);
+  });
+}
 
 function pushZrokLog(line: string) {
   const clean = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
@@ -274,12 +495,13 @@ async function getOverviewJson(): Promise<OverviewData | null> {
       }
     }
 
-    // Fallback check top-level names array if present in schema
+    // Check top-level names array from zrok2 overview --json
     if (Array.isArray(raw?.names)) {
       for (const n of raw.names) {
         const nameVal = String(n?.name || '').trim().toLowerCase();
-        const nsName = String(n?.namespaceName || n?.namespaceToken || '').toLowerCase();
-        if (nameVal && (!nsName || nsName === 'public')) {
+        const nsToken = String(n?.namespaceToken || '').toLowerCase();
+        const nsName = String(n?.namespaceName || '').toLowerCase();
+        if (nameVal && (nsToken === 'public' || nsName === 'shares.zrok.io' || (!nsToken && !nsName))) {
           reservedPublicNames.push(nameVal);
         }
       }
@@ -339,22 +561,6 @@ async function cleanupStaleZrokResources(
     const isStaleWhatsOmniEnv =
       env.description === ZROK_ENV_DESC && Boolean(currentEnvZId) && env.envZId !== currentEnvZId;
 
-    if (isStaleWhatsOmniEnv) {
-      for (const sh of env.shares) {
-        try {
-          await execZrok(['delete', 'share', sh.shareToken, '--envzid', env.envZId], 8000);
-          pushZrokLog(`Sters share Zrok vechi (${sh.shareToken}) din mediul ${env.envZId}.`);
-        } catch {}
-      }
-      try {
-        await execZrok(['delete', 'environment', env.envZId, '--force'], 10000);
-        pushZrokLog(`Curățat mediu Zrok duplicat (${env.envZId}).`);
-      } catch (err: any) {
-        pushZrokLog(`Notă curățare mediu ${env.envZId}: ${err?.message || 'ignorat'}`);
-      }
-      continue;
-    }
-
     for (const sh of env.shares) {
       const holdsTargetName =
         Boolean(normalizedCustom) &&
@@ -362,22 +568,30 @@ async function cleanupStaleZrokResources(
           const clean = u.toLowerCase();
           return (
             clean.includes(`//${normalizedCustom}.`) ||
-            clean.startsWith(`${normalizedCustom}.`)
+            clean.startsWith(`${normalizedCustom}.`) ||
+            clean.includes(normalizedCustom)
           );
         });
 
       const isCurrentEnvShare = Boolean(currentEnvZId) && env.envZId === currentEnvZId && deleteSharesInCurrentEnv;
 
-      if (isCurrentEnvShare || holdsTargetName) {
+      if (isStaleWhatsOmniEnv || isCurrentEnvShare || holdsTargetName) {
         try {
           await execZrok(['delete', 'share', sh.shareToken, '--envzid', env.envZId], 8000);
           pushZrokLog(
             holdsTargetName
               ? `Eliberat numele "${normalizedCustom}" de pe conexiunea veche (${sh.shareToken}) pentru conectare directă.`
-              : `Curățat share Zrok rezidual (${sh.shareToken}) din mediul curent.`
+              : `Curățat share Zrok rezidual (${sh.shareToken}) din mediul ${env.envZId}.`
           );
         } catch {}
       }
+    }
+
+    if (isStaleWhatsOmniEnv) {
+      try {
+        await execZrok(['delete', 'environment', env.envZId, '--force'], 10000);
+        pushZrokLog(`Curățat mediu Zrok duplicat (${env.envZId}).`);
+      } catch {}
     }
   }
 }
@@ -387,8 +601,6 @@ async function stopTunnelProcessOnly(): Promise<void> {
     pushZrokLog('Se oprește tunelul Zrok...');
     const proc = zrokProcess;
     zrokProcess = null;
-    zrokRunning = false;
-    zrokPublicUrl = null;
     try {
       proc.kill('SIGINT');
       await new Promise((r) => setTimeout(r, 900));
@@ -396,10 +608,23 @@ async function stopTunnelProcessOnly(): Promise<void> {
         if (!proc.killed) proc.kill('SIGTERM');
       } catch {}
     } catch {}
-  } else {
-    zrokRunning = false;
-    zrokPublicUrl = null;
   }
+  if (cloudflaredProcess) {
+    pushZrokLog('Se oprește tunelul de rezervă Cloudflare...');
+    const cfProc = cloudflaredProcess;
+    cloudflaredProcess = null;
+    try {
+      cfProc.kill('SIGINT');
+      await new Promise((r) => setTimeout(r, 600));
+      try {
+        if (!cfProc.killed) cfProc.kill('SIGTERM');
+      } catch {}
+    } catch {}
+  }
+  zrokRunning = false;
+  zrokPublicUrl = null;
+  activeTunnelProvider = null;
+  zrokFallbackNotice = null;
 }
 
 async function buildStatusSnapshot(): Promise<ZrokStatusSnapshot> {
@@ -407,13 +632,16 @@ async function buildStatusSnapshot(): Promise<ZrokStatusSnapshot> {
   const activeToken = (settings.token || process.env.ZROK_TOKEN || '').trim();
   const binaryInstalled = fs.existsSync(ZROK_BIN_PATH);
   const [version, isEnabled] = await Promise.all([getZrokVersion(), checkZrokEnabled()]);
+  const hasLiveProc = Boolean(zrokProcess || cloudflaredProcess);
 
   return {
     binaryInstalled,
     version,
     isEnabled,
-    isRunning: zrokRunning && !!zrokProcess,
+    isRunning: zrokRunning && hasLiveProc,
     publicUrl: zrokPublicUrl,
+    tunnelProvider: zrokRunning && hasLiveProc ? activeTunnelProvider : null,
+    fallbackNotice: zrokFallbackNotice,
     customName: settings.customName,
     autoStart: settings.autoStart,
     hasToken: Boolean(activeToken),
@@ -580,7 +808,38 @@ export async function updateZrokPreferences(partial: {
 
 export async function startZrokTunnel(
   port: number = 3000,
-  opts?: { customName?: string; basicAuth?: string; autoStart?: boolean; token?: string }
+  opts?: { customName?: string; basicAuth?: string; autoStart?: boolean; token?: string; fromWatchdog?: boolean }
+): Promise<ZrokStatusSnapshot> {
+  if (startInFlight) {
+    if (opts?.fromWatchdog) {
+      return startInFlight;
+    }
+    // Wait for ongoing start attempt before running an explicit user start
+    try {
+      await startInFlight;
+    } catch {}
+    if (!opts && zrokRunning && zrokPublicUrl) {
+      return buildStatusSnapshot();
+    }
+  }
+
+  if (!opts?.fromWatchdog) {
+    zrokBackoffAttempts = 0;
+    zrokRetryAfterMs = 0;
+  }
+
+  const runPromise = startZrokTunnelInternal(port, opts).finally(() => {
+    if (startInFlight === runPromise) {
+      startInFlight = null;
+    }
+  });
+  startInFlight = runPromise;
+  return runPromise;
+}
+
+async function startZrokTunnelInternal(
+  port: number = 3000,
+  opts?: { customName?: string; basicAuth?: string; autoStart?: boolean; token?: string; fromWatchdog?: boolean }
 ): Promise<ZrokStatusSnapshot> {
   registerZrokShutdownHooks();
   await ensureZrokBinary();
@@ -675,16 +934,26 @@ export async function startZrokTunnel(
     args.push('-n', `public:${cleanCustomName}`);
   }
 
-  if (cleanBasicAuth && cleanBasicAuth.includes(':')) {
+  const colonIdx = cleanBasicAuth.indexOf(':');
+  if (colonIdx > 0 && colonIdx < cleanBasicAuth.length - 1) {
     args.push('--basic-auth', cleanBasicAuth);
   }
 
+  let spawnAttempts = 0;
   const spawnOnce = (allowRetry: boolean): Promise<ZrokStatusSnapshot> => {
-    pushZrokLog(`Se pornește tunelul Zrok spre ${targetUrl}...`);
+    spawnAttempts++;
+    if (spawnAttempts > 3) {
+      return Promise.reject(
+        new Error('Serviciul Zrok a refuzat conexiunea temporar (limită 429 / busy). Watchdog-ul va reîncerca automat.')
+      );
+    }
+    pushZrokLog(`Se pornește tunelul Zrok spre ${targetUrl} (încercarea ${spawnAttempts}/3)...`);
 
     return new Promise((resolve, reject) => {
       let settled = false;
       let staleShareToken: string | null = null;
+      let busyDetected = false;
+      let attemptLogs: string[] = [];
       let overviewCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
       const clearTimers = () => {
@@ -696,6 +965,11 @@ export async function startZrokTunnel(
         if (settled) return;
         settled = true;
         clearTimers();
+        zrokBackoffAttempts = 0;
+        zrokRetryAfterMs = 0;
+        zrokLastError = null;
+        zrokFallbackNotice = null;
+        activeTunnelProvider = 'zrok';
         if (zrokPublicUrl) {
           await saveZrokSettings({ lastPublicUrl: zrokPublicUrl });
         }
@@ -717,6 +991,7 @@ export async function startZrokTunnel(
       zrokProcess = proc;
       zrokRunning = true;
       zrokPublicUrl = null;
+      activeTunnelProvider = 'zrok';
 
       const handleChunk = (data: Buffer) => {
         const text = data.toString();
@@ -724,7 +999,12 @@ export async function startZrokTunnel(
         for (const line of lines) {
           const cleanLine = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
           if (!cleanLine) continue;
+          attemptLogs.push(cleanLine);
           pushZrokLog(cleanLine);
+
+          if (/busy|429|503|retry shortly|limit/i.test(cleanLine)) {
+            busyDetected = true;
+          }
 
           const inUseMatch = cleanLine.match(/in use by share '([a-z0-9]+)'/i);
           if (inUseMatch?.[1]) {
@@ -773,6 +1053,7 @@ export async function startZrokTunnel(
         zrokRunning = false;
         zrokProcess = null;
         zrokPublicUrl = null;
+        activeTunnelProvider = null;
         pushZrokLog(`EROARE proces zrok2: ${err.message}`);
         finishError(err.message);
       });
@@ -783,59 +1064,63 @@ export async function startZrokTunnel(
         if (zrokProcess === proc) {
           zrokProcess = null;
           zrokPublicUrl = null;
+          activeTunnelProvider = null;
         }
         pushZrokLog(`Tunel Zrok oprit (cod=${code ?? 'null'}, signal=${signal ?? 'none'}).`);
 
-        if (wasStarting && allowRetry && (staleShareToken || cleanCustomName)) {
+        // If Zrok Cloud controller returned HTTP 429 / busy without stale-share collision, activate Cloudflare Tunnel failover automatically
+        if (wasStarting && busyDetected && !staleShareToken) {
+          settled = true;
+          clearTimers();
+          zrokBackoffAttempts = Math.min(zrokBackoffAttempts + 1, 4);
+          const cooldownSec = zrokBackoffAttempts === 1 ? 120 : zrokBackoffAttempts === 2 ? 300 : 600;
+          zrokRetryAfterMs = Date.now() + cooldownSec * 1000;
+          const reason = `Controllerul Zrok Cloud (api-v2.zrok.io) are limită activă HTTP 429 pe cont/IP. Site-ul este menținut LIVE 24/7 automat prin tunelul de rezervă Cloudflare.`;
+          pushZrokLog(`Zrok Cloud a returnat HTTP 429 (busy). Se comută automat pe tunelul de rezervă Cloudflare pentru funcționare 100% LIVE...`);
+          try {
+            const cfSnapshot = await startCloudflareFallbackTunnel(port, reason);
+            resolve(cfSnapshot);
+          } catch (cfErr: any) {
+            const fallbackErr = `Zrok Cloud HTTP 429 și failover Cloudflare eșuat: ${cfErr?.message || cfErr}`;
+            zrokLastError = fallbackErr;
+            reject(new Error(fallbackErr));
+          }
+          return;
+        }
+
+        if (wasStarting && allowRetry && (staleShareToken || (cleanCustomName && code !== 0 && !busyDetected))) {
           settled = true;
           clearTimers();
           try {
-            pushZrokLog(
-              `Se eliberează automat conexiunea veche (${staleShareToken || cleanCustomName}) și se reconectează direct...`
-            );
-            let released = false;
+            pushZrokLog('Se curăță sesiunea share anterioară și se reîncearcă pornirea în 2.5s...');
+            await new Promise((r) => setTimeout(r, 2500));
 
-            // Find exact owning envZId from overview --json so cross-env share deletion succeeds
             const overview = await getOverviewJson();
-            if (overview && staleShareToken) {
-              for (const env of overview.environments) {
-                if (env.shares.some((s) => s.shareToken === staleShareToken)) {
+            if (staleShareToken) {
+              try {
+                await execZrok(['delete', 'share', staleShareToken], 10000);
+              } catch {}
+              if (overview) {
+                for (const env of overview.environments) {
                   try {
                     await execZrok(['delete', 'share', staleShareToken, '--envzid', env.envZId], 10000);
-                    released = true;
                   } catch {}
-                  if (!released && env.description === ZROK_ENV_DESC && env.envZId !== currentLocalEnv?.envZId) {
-                    try {
-                      await execZrok(['delete', 'environment', env.envZId, '--force'], 10000);
-                      released = true;
-                    } catch {}
-                  }
                 }
               }
             }
 
-            if (!released && staleShareToken) {
-              try {
-                await execZrok(['delete', 'share', staleShareToken], 10000);
-                released = true;
-              } catch {}
-            }
-
-            if (!released && cleanCustomName) {
-              try {
-                await execZrok(['delete', 'share', `public:${cleanCustomName}`], 10000);
-                released = true;
-              } catch {}
-            }
-
-            if (!released && cleanCustomName) {
-              // Last-resort fallback only if name is actively locked on another un-deletable external device
-              const nIdx = args.indexOf('-n');
-              if (nIdx !== -1) {
-                args.splice(nIdx, 2);
-                pushZrokLog(
-                  `Numele "${cleanCustomName}" este activ pe alt dispozitiv extern; se pornește cu adresă Zrok temporară...`
-                );
+            if (overview && cleanCustomName) {
+              for (const env of overview.environments) {
+                for (const sh of env.shares) {
+                  const holdsName =
+                    sh.shareToken === staleShareToken ||
+                    sh.frontendEndpoints.some((u) => u.toLowerCase().includes(cleanCustomName));
+                  if (holdsName) {
+                    try {
+                      await execZrok(['delete', 'share', sh.shareToken, '--envzid', env.envZId], 10000);
+                    } catch {}
+                  }
+                }
               }
             }
 
@@ -850,7 +1135,8 @@ export async function startZrokTunnel(
 
         if (wasStarting) {
           finishError(
-            zrokLogs[zrokLogs.length - 1] ||
+            attemptLogs[attemptLogs.length - 1] ||
+              zrokLogs[zrokLogs.length - 1] ||
               `zrok2 s-a oprit neașteptat (cod ${code ?? 'unknown'}). Verifică tokenul sau numele ales.`
           );
         }
@@ -889,15 +1175,19 @@ export async function autoStartZrokIfConfigured(port: number = 3000): Promise<vo
   const shouldStart = Boolean(token) && (settings.autoStart || process.env.ZROK_AUTO_START === 'true');
   if (!shouldStart) return;
 
-  try {
-    console.log('[ZROK] Auto-starting public Zrok tunnel for entire site...');
-    const status = await startZrokTunnel(port);
-    if (status.publicUrl) {
-      console.log(`[ZROK] Entire site is LIVE on Zrok: ${status.publicUrl}`);
+  // Wait 3 seconds for Express server to fully bind to port before launching tunnel
+  setTimeout(async () => {
+    try {
+      if (zrokRunning || startInFlight) return;
+      console.log('[ZROK] Auto-starting public Zrok tunnel for entire site...');
+      const status = await startZrokTunnel(port, { fromWatchdog: true });
+      if (status.publicUrl) {
+        console.log(`[ZROK] Entire site is LIVE on Zrok: ${status.publicUrl}`);
+      }
+    } catch (err: any) {
+      console.warn('[ZROK] Auto-start initial attempt paused:', err?.message || err);
     }
-  } catch (err: any) {
-    console.warn('[ZROK] Auto-start failed:', err?.message || err);
-  }
+  }, 3000);
 }
 
 export function registerZrokShutdownHooks() {
@@ -909,6 +1199,12 @@ export function registerZrokShutdownHooks() {
         zrokProcess.kill('SIGINT');
       } catch {}
       zrokProcess = null;
+    }
+    if (cloudflaredProcess) {
+      try {
+        cloudflaredProcess.kill('SIGINT');
+      } catch {}
+      cloudflaredProcess = null;
     }
   };
   process.on('exit', cleanup);
@@ -1054,29 +1350,43 @@ export async function runZrokDiagnostics(port: number = 3000): Promise<ZrokDiagn
   const t5 = Date.now();
   if (zrokRunning && zrokPublicUrl) {
     const normalizedLiveUrl = normalizeZrokUrl(zrokPublicUrl);
-    try {
-      const liveRes = await fetch(`${normalizedLiveUrl}/api/health`, {
-        signal: AbortSignal.timeout(8000),
-      });
-      const liveJson: any = await liveRes.json().catch(() => ({}));
-      const liveOk = liveRes.ok && liveJson?.ok === true;
+    const diagSettings = await loadZrokSettings();
+    let lastLiveErr: any = null;
+    let healthResult: { ok: boolean; status: number; body: any } | null = null;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        healthResult = await fetchPublicTunnelHealth(
+          normalizedLiveUrl,
+          activeTunnelProvider === 'zrok' ? getZrokBasicAuthHeader(diagSettings.basicAuth) : {}
+        );
+        if (healthResult.ok || attempt === 2) break;
+      } catch (err: any) {
+        lastLiveErr = err;
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 2500));
+        }
+      }
+    }
+
+    if (healthResult) {
       checks.push({
         id: 'tunnel_live',
-        name: 'Test End-to-End Link Public Zrok',
-        passed: liveOk,
-        status: liveOk ? 'PASS' : 'FAIL',
-        details: liveOk
-          ? `Site-ul răspunde live prin internet la ${normalizedLiveUrl} (HTTP ${liveRes.status}).`
-          : `Tunelul a returnat HTTP ${liveRes.status} la ${normalizedLiveUrl}`,
+        name: 'Test End-to-End Link Public',
+        passed: healthResult.ok,
+        status: healthResult.ok ? 'PASS' : 'FAIL',
+        details: healthResult.ok
+          ? `Site-ul răspunde live prin internet la ${normalizedLiveUrl} (HTTP ${healthResult.status}).`
+          : `Tunelul a returnat HTTP ${healthResult.status} la ${normalizedLiveUrl}`,
         durationMs: Date.now() - t5,
       });
-    } catch (err: any) {
+    } else {
       checks.push({
         id: 'tunnel_live',
-        name: 'Test End-to-End Link Public Zrok',
+        name: 'Test End-to-End Link Public',
         passed: false,
         status: 'FAIL',
-        details: `Nu s-a putut accesa ${normalizedLiveUrl}: ${err?.message || 'eroare'}`,
+        details: `Nu s-a putut accesa ${normalizedLiveUrl}: ${lastLiveErr?.message || 'eroare'}`,
         durationMs: Date.now() - t5,
       });
     }
