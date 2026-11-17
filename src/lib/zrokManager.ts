@@ -7,6 +7,7 @@ const ROOT_DIR = process.cwd();
 const BIN_DIR = path.resolve(ROOT_DIR, 'bin');
 const ZROK_BIN_PATH = path.resolve(BIN_DIR, 'zrok2');
 const ZROK_HOME_DIR = path.resolve(ROOT_DIR, '.zrok_data');
+const ZROK_ENV_DESC = 'WhatsOmni-AI-Cloud';
 const ZROK_DOWNLOAD_URL =
   'https://github.com/openziti/zrok/releases/download/v2.0.9/zrok_2.0.9_linux_amd64.tar.gz';
 
@@ -33,6 +34,31 @@ export interface ZrokStatusSnapshot {
   logs: string[];
 }
 
+interface LocalZrokEnv {
+  zrokToken: string;
+  envZId: string;
+  apiEndpoint?: string;
+  filePath: string;
+}
+
+interface OverviewShare {
+  shareToken: string;
+  shareMode?: string;
+  backendProxyEndpoint?: string;
+  frontendEndpoints: string[];
+}
+
+interface OverviewEnvironment {
+  envZId: string;
+  description: string;
+  shares: OverviewShare[];
+}
+
+interface OverviewData {
+  environments: OverviewEnvironment[];
+  reservedPublicNames: string[];
+}
+
 let zrokProcess: ChildProcess | null = null;
 let zrokRunning = false;
 let zrokPublicUrl: string | null = null;
@@ -48,6 +74,7 @@ let zrokSettingsCache: ZrokSettings = {
 };
 let settingsLoaded = false;
 let hooksRegistered = false;
+let syncInFlight: Promise<void> | null = null;
 
 function pushZrokLog(line: string) {
   const clean = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
@@ -67,6 +94,55 @@ function getZrokEnv(): NodeJS.ProcessEnv {
     ...process.env,
     HOME: ZROK_HOME_DIR,
   };
+}
+
+function readLocalZrokEnv(): LocalZrokEnv | null {
+  const candidates = [
+    path.join(ZROK_HOME_DIR, '.zrok2', 'environment.json'),
+    path.join(ZROK_HOME_DIR, '.zrok', 'environment.json'),
+  ];
+  for (const filePath of candidates) {
+    if (!fs.existsSync(filePath)) continue;
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      const zrokToken = String(parsed?.zrok_token || parsed?.zrokToken || '').trim();
+      const envZId = String(parsed?.ziti_identity || parsed?.env_zid || parsed?.envZId || '').trim();
+      if (zrokToken || envZId) {
+        return {
+          zrokToken,
+          envZId,
+          apiEndpoint: parsed?.api_endpoint ? String(parsed.api_endpoint) : undefined,
+          filePath,
+        };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function wipeLocalZrokEnv() {
+  const dirs = [
+    path.join(ZROK_HOME_DIR, '.zrok2'),
+    path.join(ZROK_HOME_DIR, '.zrok'),
+  ];
+  for (const dir of dirs) {
+    if (fs.existsSync(dir)) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+}
+
+async function killOrphanedZrokShareProcesses(): Promise<void> {
+  if (zrokProcess && !zrokProcess.killed) return;
+  await new Promise<void>((resolve) => {
+    execFile('pkill', ['-INT', '-f', `${ZROK_BIN_PATH} share`], { timeout: 2500 }, () => {
+      resolve();
+    });
+  });
+  await new Promise((r) => setTimeout(r, 300));
 }
 
 async function loadZrokSettings(): Promise<ZrokSettings> {
@@ -154,33 +230,183 @@ async function getZrokVersion(): Promise<string | null> {
   }
 }
 
-export async function checkZrokEnabled(): Promise<boolean> {
-  if (!fs.existsSync(ZROK_BIN_PATH)) return false;
-  const envFile1 = path.join(ZROK_HOME_DIR, '.zrok2', 'environment.json');
-  const envFile2 = path.join(ZROK_HOME_DIR, '.zrok', 'environment.json');
-  if (fs.existsSync(envFile1) || fs.existsSync(envFile2)) {
-    return true;
+async function getOverviewJson(): Promise<OverviewData | null> {
+  try {
+    const { stdout } = await execZrok(['overview', '--json'], 10000);
+    const raw = JSON.parse(stdout);
+    const environments: OverviewEnvironment[] = [];
+    const envList = Array.isArray(raw?.environments) ? raw.environments : [];
+
+    for (const item of envList) {
+      const envMeta = item?.environment || item || {};
+      const envZId = String(envMeta?.zId || envMeta?.envZId || '').trim();
+      if (!envZId) continue;
+      const description = String(envMeta?.description || '').trim();
+      const rawShares = Array.isArray(item?.shares) ? item.shares : [];
+      const shares: OverviewShare[] = rawShares
+        .map((s: any) => ({
+          shareToken: String(s?.shareToken || s?.token || '').trim(),
+          shareMode: s?.shareMode ? String(s.shareMode) : undefined,
+          backendProxyEndpoint: s?.backendProxyEndpoint
+            ? String(s.backendProxyEndpoint)
+            : s?.target
+            ? String(s.target)
+            : undefined,
+          frontendEndpoints: Array.isArray(s?.frontendEndpoints)
+            ? s.frontendEndpoints.map((u: any) => String(u))
+            : [],
+        }))
+        .filter((s: OverviewShare) => Boolean(s.shareToken));
+
+      environments.push({ envZId, description, shares });
+    }
+
+    const reservedPublicNames: string[] = [];
+    const nsList = Array.isArray(raw?.namespaces) ? raw.namespaces : [];
+    for (const ns of nsList) {
+      const nsToken = String(ns?.namespaceToken || ns?.token || ns?.name || '').toLowerCase();
+      const names = Array.isArray(ns?.names) ? ns.names : [];
+      for (const n of names) {
+        const nameVal = String(typeof n === 'string' ? n : n?.name || '').trim().toLowerCase();
+        if (nameVal && (!nsToken || nsToken === 'public')) {
+          reservedPublicNames.push(nameVal);
+        }
+      }
+    }
+
+    // Fallback check top-level names array if present in schema
+    if (Array.isArray(raw?.names)) {
+      for (const n of raw.names) {
+        const nameVal = String(n?.name || '').trim().toLowerCase();
+        const nsName = String(n?.namespaceName || n?.namespaceToken || '').toLowerCase();
+        if (nameVal && (!nsName || nsName === 'public')) {
+          reservedPublicNames.push(nameVal);
+        }
+      }
+    }
+
+    return { environments, reservedPublicNames };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeZrokUrl(rawUrl: string): string {
+  const clean = rawUrl.trim().replace(/\/+$/, '');
+  if (!clean) return clean;
+  return /^https?:\/\//i.test(clean) ? clean : `https://${clean}`;
+}
+
+async function findActiveShareForEnv(currentEnvZId?: string): Promise<{ shareToken?: string; publicUrl?: string }> {
+  const overview = await getOverviewJson();
+  if (overview) {
+    const targetEnvs = currentEnvZId
+      ? overview.environments.filter((e) => e.envZId === currentEnvZId)
+      : overview.environments;
+    for (const env of targetEnvs) {
+      for (const sh of env.shares) {
+        const url = sh.frontendEndpoints.find((u) => /\.zrok\.io/i.test(u));
+        if (url) {
+          return { shareToken: sh.shareToken, publicUrl: normalizeZrokUrl(url) };
+        }
+      }
+    }
   }
   try {
-    const { stdout } = await execZrok(['status'], 5000);
-    return !stdout.includes('To create a local environment') && /Environment|Ziti/i.test(stdout);
+    const { stdout } = await execZrok(['overview'], 8000);
+    const urlMatch = stdout.match(/([a-zA-Z0-9-]+\.shares?\.zrok\.io)/i);
+    const shareMatch = stdout.match(/│\s*([a-z0-9]{10,16})\s*│\s*public\s*│/i);
+    return {
+      shareToken: shareMatch?.[1],
+      publicUrl: urlMatch?.[1] ? normalizeZrokUrl(urlMatch[1]) : undefined,
+    };
   } catch {
-    return false;
+    return {};
   }
 }
 
-function maskToken(tok: string): string | null {
-  const t = tok.trim();
-  if (!t) return null;
-  if (t.length <= 6) return '***';
-  return `${t.slice(0, 3)}••••${t.slice(-3)}`;
+async function cleanupStaleZrokResources(
+  currentEnvZId?: string,
+  targetCustomName?: string,
+  deleteSharesInCurrentEnv: boolean = false
+): Promise<void> {
+  const overview = await getOverviewJson();
+  if (!overview) return;
+
+  const normalizedCustom = (targetCustomName || '').trim().toLowerCase();
+
+  for (const env of overview.environments) {
+    const isStaleWhatsOmniEnv =
+      env.description === ZROK_ENV_DESC && Boolean(currentEnvZId) && env.envZId !== currentEnvZId;
+
+    if (isStaleWhatsOmniEnv) {
+      for (const sh of env.shares) {
+        try {
+          await execZrok(['delete', 'share', sh.shareToken, '--envzid', env.envZId], 8000);
+          pushZrokLog(`Sters share Zrok vechi (${sh.shareToken}) din mediul ${env.envZId}.`);
+        } catch {}
+      }
+      try {
+        await execZrok(['delete', 'environment', env.envZId, '--force'], 10000);
+        pushZrokLog(`Curățat mediu Zrok duplicat (${env.envZId}).`);
+      } catch (err: any) {
+        pushZrokLog(`Notă curățare mediu ${env.envZId}: ${err?.message || 'ignorat'}`);
+      }
+      continue;
+    }
+
+    for (const sh of env.shares) {
+      const holdsTargetName =
+        Boolean(normalizedCustom) &&
+        sh.frontendEndpoints.some((u) => {
+          const clean = u.toLowerCase();
+          return (
+            clean.includes(`//${normalizedCustom}.`) ||
+            clean.startsWith(`${normalizedCustom}.`)
+          );
+        });
+
+      const isCurrentEnvShare = Boolean(currentEnvZId) && env.envZId === currentEnvZId && deleteSharesInCurrentEnv;
+
+      if (isCurrentEnvShare || holdsTargetName) {
+        try {
+          await execZrok(['delete', 'share', sh.shareToken, '--envzid', env.envZId], 8000);
+          pushZrokLog(
+            holdsTargetName
+              ? `Eliberat numele "${normalizedCustom}" de pe conexiunea veche (${sh.shareToken}) pentru conectare directă.`
+              : `Curățat share Zrok rezidual (${sh.shareToken}) din mediul curent.`
+          );
+        } catch {}
+      }
+    }
+  }
 }
 
-export async function getZrokStatus(): Promise<ZrokStatusSnapshot> {
+async function stopTunnelProcessOnly(): Promise<void> {
+  if (zrokProcess) {
+    pushZrokLog('Se oprește tunelul Zrok...');
+    const proc = zrokProcess;
+    zrokProcess = null;
+    zrokRunning = false;
+    zrokPublicUrl = null;
+    try {
+      proc.kill('SIGINT');
+      await new Promise((r) => setTimeout(r, 900));
+      try {
+        if (!proc.killed) proc.kill('SIGTERM');
+      } catch {}
+    } catch {}
+  } else {
+    zrokRunning = false;
+    zrokPublicUrl = null;
+  }
+}
+
+async function buildStatusSnapshot(): Promise<ZrokStatusSnapshot> {
   const settings = await loadZrokSettings();
+  const activeToken = (settings.token || process.env.ZROK_TOKEN || '').trim();
   const binaryInstalled = fs.existsSync(ZROK_BIN_PATH);
   const [version, isEnabled] = await Promise.all([getZrokVersion(), checkZrokEnabled()]);
-  const activeToken = settings.token || process.env.ZROK_TOKEN || '';
 
   return {
     binaryInstalled,
@@ -198,7 +424,69 @@ export async function getZrokStatus(): Promise<ZrokStatusSnapshot> {
   };
 }
 
-export async function enableZrok(token: string, description: string = 'WhatsOmni-AI-Cloud'): Promise<ZrokStatusSnapshot> {
+async function syncLocalEnvWithSettings(): Promise<void> {
+  if (syncInFlight) return syncInFlight;
+  syncInFlight = (async () => {
+    if (!fs.existsSync(ZROK_BIN_PATH)) return;
+    const settings = await loadZrokSettings();
+    const configuredToken = (settings.token || process.env.ZROK_TOKEN || '').trim();
+    if (!configuredToken) return;
+
+    const localEnv = readLocalZrokEnv();
+    if (!localEnv || localEnv.zrokToken !== configuredToken) {
+      pushZrokLog('Token Zrok actualizat detectat; se sincronizează mediul local cu noul token...');
+      await enableZrok(configuredToken);
+    }
+  })().finally(() => {
+    syncInFlight = null;
+  });
+  return syncInFlight;
+}
+
+export async function checkZrokEnabled(): Promise<boolean> {
+  if (!fs.existsSync(ZROK_BIN_PATH)) return false;
+  const settings = await loadZrokSettings();
+  const configuredToken = (settings.token || process.env.ZROK_TOKEN || '').trim();
+  const localEnv = readLocalZrokEnv();
+
+  if (localEnv) {
+    if (configuredToken && localEnv.zrokToken && localEnv.zrokToken !== configuredToken) {
+      return false;
+    }
+    return true;
+  }
+
+  try {
+    const { stdout } = await execZrok(['status'], 5000);
+    return !stdout.includes('To create a local environment') && /Environment|Ziti/i.test(stdout);
+  } catch {
+    return false;
+  }
+}
+
+function maskToken(tok: string): string | null {
+  const t = tok.trim();
+  if (!t) return null;
+  if (t.length <= 6) return '***';
+  return `${t.slice(0, 3)}••••${t.slice(-3)}`;
+}
+
+export async function getZrokStatus(): Promise<ZrokStatusSnapshot> {
+  const settings = await loadZrokSettings();
+  const activeToken = (settings.token || process.env.ZROK_TOKEN || '').trim();
+  const localEnv = readLocalZrokEnv();
+
+  // Auto-sync silently if DB holds a newer token than .zrok2/environment.json and tunnel isn't active
+  if (activeToken && (!localEnv || localEnv.zrokToken !== activeToken) && !zrokRunning) {
+    try {
+      await syncLocalEnvWithSettings();
+    } catch {}
+  }
+
+  return buildStatusSnapshot();
+}
+
+export async function enableZrok(token: string, description: string = ZROK_ENV_DESC): Promise<ZrokStatusSnapshot> {
   const cleanToken = String(token || '').trim();
   if (!cleanToken) {
     throw new Error('Introdu un token valid Zrok (obținut din contul tău zrok.io).');
@@ -207,29 +495,42 @@ export async function enableZrok(token: string, description: string = 'WhatsOmni
   await ensureZrokBinary();
   zrokLastError = null;
 
-  const alreadyEnabled = await checkZrokEnabled();
-  if (alreadyEnabled) {
-    const currentSettings = await loadZrokSettings();
-    if (currentSettings.token && currentSettings.token !== cleanToken) {
-      pushZrokLog('Se înlocuiește mediul Zrok existent cu noul token...');
-      await stopZrokTunnel();
-      try {
-        await execZrok(['disable'], 10000);
-      } catch {}
-    } else {
+  const localEnv = readLocalZrokEnv();
+  if (localEnv && localEnv.zrokToken === cleanToken) {
+    // Verify existing environment is still authorized on the Zrok controller
+    try {
+      await execZrok(['overview', '--json'], 8000);
       await saveZrokSettings({ token: cleanToken });
-      pushZrokLog('Mediul Zrok este deja activat pentru acest server.');
-      return getZrokStatus();
+      await cleanupStaleZrokResources(localEnv.envZId);
+      pushZrokLog('Mediul Zrok existent este valid și conectat direct (fără duplicate).');
+      return buildStatusSnapshot();
+    } catch (verifyErr: any) {
+      pushZrokLog(`Mediul Zrok local necesită re-activare (${verifyErr?.message || 'sesiune expirată'})...`);
     }
+  } else if (localEnv) {
+    pushZrokLog('Token Zrok schimbat: se curăță mediul anterior și se configurează noul token...');
   }
 
-  pushZrokLog('Se activează mediul Zrok cu tokenul configurat...');
+  await stopTunnelProcessOnly();
+  await killOrphanedZrokShareProcesses();
+
+  // Attempt graceful disable first (ignore 401 if old token was revoked)
+  try {
+    await execZrok(['disable'], 8000);
+  } catch {}
+  wipeLocalZrokEnv();
+
+  // Persist token immediately so DB stays in sync with user intent
+  await saveZrokSettings({ token: cleanToken });
+
+  pushZrokLog('Se activează mediul Zrok cu noul token...');
   try {
     const { stdout, stderr } = await execZrok(['enable', cleanToken, '--headless', '-d', description], 20000);
     if (stdout) pushZrokLog(stdout);
     if (stderr) pushZrokLog(stderr);
-    await saveZrokSettings({ token: cleanToken });
-    pushZrokLog('Zrok activat cu succes!');
+    const freshEnv = readLocalZrokEnv();
+    await cleanupStaleZrokResources(freshEnv?.envZId);
+    pushZrokLog('Zrok activat cu succes! Conexiunile vechi au fost curățate.');
   } catch (err: any) {
     const msg = err?.message || 'Activarea Zrok a eșuat.';
     zrokLastError = msg;
@@ -237,56 +538,27 @@ export async function enableZrok(token: string, description: string = 'WhatsOmni
     throw new Error(msg);
   }
 
-  return getZrokStatus();
-}
-
-async function findActiveShareForEnv(): Promise<{ shareToken?: string; publicUrl?: string }> {
-  try {
-    const { stdout } = await execZrok(['overview'], 8000);
-    const urlMatch = stdout.match(/([a-zA-Z0-9-]+\.shares?\.zrok\.io)/i);
-    // Look for share rows under this environment
-    const shareMatch = stdout.match(/│\s*([a-z0-9]{10,16})\s*│\s*public\s*│/i);
-    return {
-      shareToken: shareMatch?.[1],
-      publicUrl: urlMatch?.[1] ? `https://${urlMatch[1]}` : undefined,
-    };
-  } catch {
-    return {};
-  }
+  return buildStatusSnapshot();
 }
 
 export async function stopZrokTunnel(): Promise<ZrokStatusSnapshot> {
-  if (zrokProcess) {
-    pushZrokLog('Se oprește tunelul Zrok...');
-    const proc = zrokProcess;
-    zrokProcess = null;
-    zrokRunning = false;
-    zrokPublicUrl = null;
-    try {
-      proc.kill('SIGINT');
-      await new Promise((r) => setTimeout(r, 800));
-      try {
-        if (!proc.killed) proc.kill('SIGTERM');
-      } catch {}
-    } catch {}
-  } else {
-    zrokRunning = false;
-    zrokPublicUrl = null;
-  }
-  return getZrokStatus();
+  await stopTunnelProcessOnly();
+  return buildStatusSnapshot();
 }
 
 export async function disableZrok(): Promise<ZrokStatusSnapshot> {
-  await stopZrokTunnel();
+  await stopTunnelProcessOnly();
+  await killOrphanedZrokShareProcesses();
   try {
     if (fs.existsSync(ZROK_BIN_PATH)) {
-      await execZrok(['disable'], 10000);
+      await execZrok(['disable'], 8000);
     }
   } catch {}
+  wipeLocalZrokEnv();
   await saveZrokSettings({ token: '', autoStart: false, lastPublicUrl: '' });
   zrokLastError = null;
   pushZrokLog('Mediul Zrok a fost dezactivat și tokenul șters.');
-  return getZrokStatus();
+  return buildStatusSnapshot();
 }
 
 export async function updateZrokPreferences(partial: {
@@ -303,7 +575,7 @@ export async function updateZrokPreferences(partial: {
     ...(typeof partial.autoStart === 'boolean' ? { autoStart: partial.autoStart } : {}),
     ...(typeof partial.basicAuth === 'string' ? { basicAuth: partial.basicAuth.trim() } : {}),
   });
-  return getZrokStatus();
+  return buildStatusSnapshot();
 }
 
 export async function startZrokTunnel(
@@ -316,30 +588,42 @@ export async function startZrokTunnel(
 
   if (opts?.token && opts.token.trim()) {
     await enableZrok(opts.token.trim());
+  } else {
+    const savedToken = (settings.token || process.env.ZROK_TOKEN || '').trim();
+    const localEnv = readLocalZrokEnv();
+
+    if (!localEnv) {
+      if (!savedToken) {
+        throw new Error('Zrok nu este activat încă. Introdu mai întâi tokenul tău Zrok.');
+      }
+      await enableZrok(savedToken);
+    } else if (savedToken && localEnv.zrokToken !== savedToken) {
+      await enableZrok(savedToken);
+    } else {
+      // Validate current env doesn't return 401 Unauthorized
+      try {
+        await execZrok(['overview', '--json'], 8000);
+      } catch (authErr: any) {
+        if (savedToken) {
+          pushZrokLog(`Token local invalid (${authErr?.message || '401'}); se re-activează cu tokenul salvat...`);
+          await enableZrok(savedToken);
+        } else {
+          throw new Error('Tokenul Zrok local este expirat sau invalid (401). Introdu noul token Zrok.');
+        }
+      }
+    }
   }
 
-  let enabled = await checkZrokEnabled();
-  if (!enabled) {
-    const fallbackToken = settings.token || process.env.ZROK_TOKEN || '';
-    if (!fallbackToken) {
-      throw new Error('Zrok nu este activat încă. Introdu mai întâi tokenul tău Zrok.');
-    }
-    await enableZrok(fallbackToken);
-    enabled = await checkZrokEnabled();
-    if (!enabled) {
-      throw new Error('Nu s-a putut activa mediul Zrok cu tokenul salvat.');
-    }
-  }
-
-  const rawCustomName = opts?.customName !== undefined ? opts.customName : settings.customName;
+  const latestSettings = await loadZrokSettings();
+  const rawCustomName = opts?.customName !== undefined ? opts.customName : latestSettings.customName;
   const cleanCustomName = String(rawCustomName || '')
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, '');
   const cleanBasicAuth =
-    opts?.basicAuth !== undefined ? String(opts.basicAuth).trim() : settings.basicAuth;
+    opts?.basicAuth !== undefined ? String(opts.basicAuth).trim() : latestSettings.basicAuth;
   const nextAutoStart =
-    typeof opts?.autoStart === 'boolean' ? opts.autoStart : settings.autoStart;
+    typeof opts?.autoStart === 'boolean' ? opts.autoStart : latestSettings.autoStart;
 
   await saveZrokSettings({
     customName: cleanCustomName,
@@ -348,21 +632,44 @@ export async function startZrokTunnel(
   });
 
   if (zrokProcess && zrokRunning) {
-    await stopZrokTunnel();
+    await stopTunnelProcessOnly();
   }
+  await killOrphanedZrokShareProcesses();
+
+  // Clean up any stale WhatsOmni environments or lingering shares before launching so we connect DIRECTLY
+  const currentLocalEnv = readLocalZrokEnv();
+  await cleanupStaleZrokResources(currentLocalEnv?.envZId, cleanCustomName, true);
 
   zrokLastError = null;
   const targetUrl = `http://127.0.0.1:${port}`;
   const args = ['share', 'public', targetUrl, '--headless'];
 
   if (cleanCustomName) {
-    try {
-      pushZrokLog(`Se verifică/rezervă numele "${cleanCustomName}" în namespace-ul public...`);
-      await execZrok(['create', 'name', cleanCustomName, '-n', 'public'], 10000);
-    } catch (nameErr: any) {
-      const msg = nameErr?.message || '';
-      if (!/exist|conflict|taken|409/i.test(msg)) {
-        pushZrokLog(`Notă nume personalizat: ${msg}`);
+    if (cleanCustomName.length < 3 || cleanCustomName.length > 32) {
+      const msg = `Subdomeniul personalizat "${cleanCustomName}" este prea scurt (Zrok cere minim 3 caractere, ex: alexandru sau alexia-bot). Modifică subdomeniul sau lasă-l gol.`;
+      zrokLastError = msg;
+      pushZrokLog(`EROARE subdomeniu: ${msg}`);
+      throw new Error(msg);
+    }
+    const overview = await getOverviewJson();
+    const alreadyReserved = overview?.reservedPublicNames?.includes(cleanCustomName);
+    if (alreadyReserved) {
+      pushZrokLog(`Numele "${cleanCustomName}" există în cont; se conectează direct la https://${cleanCustomName}.shares.zrok.io...`);
+    } else {
+      try {
+        pushZrokLog(`Se rezervă numele "${cleanCustomName}" în namespace-ul public...`);
+        await execZrok(['create', 'name', cleanCustomName, '-n', 'public'], 10000);
+      } catch (nameErr: any) {
+        const msg = nameErr?.message || '';
+        if (/not a valid share name|DNS check|profanity/i.test(msg)) {
+          const userMsg = `Subdomeniul "${cleanCustomName}" a fost respins de Zrok (${msg}). Alege alt nume cu minim 3 caractere (ex: alexandru sau alexia-bot).`;
+          zrokLastError = userMsg;
+          pushZrokLog(`EROARE subdomeniu: ${userMsg}`);
+          throw new Error(userMsg);
+        }
+        if (!/exist|conflict|taken|409/i.test(msg)) {
+          pushZrokLog(`Notă nume personalizat: ${msg}`);
+        }
       }
     }
     args.push('-n', `public:${cleanCustomName}`);
@@ -392,7 +699,7 @@ export async function startZrokTunnel(
         if (zrokPublicUrl) {
           await saveZrokSettings({ lastPublicUrl: zrokPublicUrl });
         }
-        resolve(await getZrokStatus());
+        resolve(await buildStatusSnapshot());
       };
 
       const finishError = async (errMsg: string) => {
@@ -444,19 +751,20 @@ export async function startZrokTunnel(
       proc.stdout?.on('data', handleChunk);
       proc.stderr?.on('data', handleChunk);
 
-      // Fallback check via `zrok2 overview` in case headless mode hides the banner line
+      // Query live controller overview after startup in case headless mode hides the URL banner
       overviewCheckTimer = setTimeout(async () => {
         if (settled || !zrokRunning || zrokPublicUrl) return;
-        if (cleanCustomName) {
-          zrokPublicUrl = `https://${cleanCustomName}.shares.zrok.io`;
-          pushZrokLog(`Tunel activ detectat pe https://${cleanCustomName}.shares.zrok.io`);
+        const info = await findActiveShareForEnv(currentLocalEnv?.envZId);
+        if (settled || !zrokRunning || zrokPublicUrl) return;
+        if (info.publicUrl) {
+          zrokPublicUrl = normalizeZrokUrl(info.publicUrl);
+          pushZrokLog(`Tunel activ conectat direct: ${zrokPublicUrl}`);
           finishSuccess();
           return;
         }
-        const info = await findActiveShareForEnv();
-        if (info.publicUrl) {
-          zrokPublicUrl = info.publicUrl;
-          pushZrokLog(`Tunel activ detectat: ${zrokPublicUrl}`);
+        if (cleanCustomName) {
+          zrokPublicUrl = `https://${cleanCustomName}.shares.zrok.io`;
+          pushZrokLog(`Tunel activ conectat direct pe ${zrokPublicUrl}`);
           finishSuccess();
         }
       }, 3500);
@@ -478,35 +786,56 @@ export async function startZrokTunnel(
         }
         pushZrokLog(`Tunel Zrok oprit (cod=${code ?? 'null'}, signal=${signal ?? 'none'}).`);
 
-        if (wasStarting && allowRetry && staleShareToken) {
+        if (wasStarting && allowRetry && (staleShareToken || cleanCustomName)) {
           settled = true;
           clearTimers();
           try {
-            pushZrokLog(`Se eliberează automat sesiunea Zrok veche (${staleShareToken}) și se reîncearcă...`);
+            pushZrokLog(
+              `Se eliberează automat conexiunea veche (${staleShareToken || cleanCustomName}) și se reconectează direct...`
+            );
             let released = false;
-            try {
-              await execZrok(['delete', 'share', staleShareToken], 10000);
-              released = true;
-            } catch (delErr: any) {
-              const delMsg = delErr?.message || '';
-              if (!/404|not found/i.test(delMsg)) {
-                throw delErr;
+
+            // Find exact owning envZId from overview --json so cross-env share deletion succeeds
+            const overview = await getOverviewJson();
+            if (overview && staleShareToken) {
+              for (const env of overview.environments) {
+                if (env.shares.some((s) => s.shareToken === staleShareToken)) {
+                  try {
+                    await execZrok(['delete', 'share', staleShareToken, '--envzid', env.envZId], 10000);
+                    released = true;
+                  } catch {}
+                  if (!released && env.description === ZROK_ENV_DESC && env.envZId !== currentLocalEnv?.envZId) {
+                    try {
+                      await execZrok(['delete', 'environment', env.envZId, '--force'], 10000);
+                      released = true;
+                    } catch {}
+                  }
+                }
               }
             }
 
-            // If share belonged to a previous expired container environment (404 on current env),
-            // reset the custom name or fall back to an ephemeral zrok URL so tunnel always goes live.
+            if (!released && staleShareToken) {
+              try {
+                await execZrok(['delete', 'share', staleShareToken], 10000);
+                released = true;
+              } catch {}
+            }
+
             if (!released && cleanCustomName) {
               try {
-                await execZrok(['delete', 'name', cleanCustomName, '-n', 'public'], 10000);
-                await execZrok(['create', 'name', cleanCustomName, '-n', 'public'], 10000);
-              } catch {
-                // Drop -n public:<customName> on fallback retry so site still goes live on Zrok
-                const nIdx = args.indexOf('-n');
-                if (nIdx !== -1) {
-                  args.splice(nIdx, 2);
-                  pushZrokLog(`Numele "${cleanCustomName}" este blocat în altă sesiune; se pornește cu adresă Zrok nouă...`);
-                }
+                await execZrok(['delete', 'share', `public:${cleanCustomName}`], 10000);
+                released = true;
+              } catch {}
+            }
+
+            if (!released && cleanCustomName) {
+              // Last-resort fallback only if name is actively locked on another un-deletable external device
+              const nIdx = args.indexOf('-n');
+              if (nIdx !== -1) {
+                args.splice(nIdx, 2);
+                pushZrokLog(
+                  `Numele "${cleanCustomName}" este activ pe alt dispozitiv extern; se pornește cu adresă Zrok temporară...`
+                );
               }
             }
 
@@ -531,7 +860,7 @@ export async function startZrokTunnel(
         if (!settled) {
           if (zrokRunning && !zrokPublicUrl) {
             settled = true;
-            resolve(await getZrokStatus());
+            resolve(await buildStatusSnapshot());
           } else {
             finishError('Timeout la pornirea tunelului Zrok (18s).');
           }
@@ -546,7 +875,17 @@ export async function startZrokTunnel(
 export async function autoStartZrokIfConfigured(port: number = 3000): Promise<void> {
   registerZrokShutdownHooks();
   const settings = await loadZrokSettings();
-  const token = settings.token || process.env.ZROK_TOKEN || '';
+  const token = (settings.token || process.env.ZROK_TOKEN || '').trim();
+
+  // Always keep .zrok2 environment synced with latest DB token even when autoStart is disabled
+  if (token) {
+    try {
+      await syncLocalEnvWithSettings();
+    } catch (err: any) {
+      console.warn('[ZROK] Startup token sync warning:', err?.message || err);
+    }
+  }
+
   const shouldStart = Boolean(token) && (settings.autoStart || process.env.ZROK_AUTO_START === 'true');
   if (!shouldStart) return;
 
@@ -683,25 +1022,40 @@ export async function runZrokDiagnostics(port: number = 3000): Promise<ZrokDiagn
     });
   }
 
-  // 4. Local Zrok environment enabled check
+  // 4. Local Zrok environment & token validity check
   const t4 = Date.now();
+  try {
+    await syncLocalEnvWithSettings();
+  } catch {}
   const isEnabled = await checkZrokEnabled();
+  let envValid = false;
+  let envDetails = 'Tokenul Zrok nu a fost activat încă. Introdu tokenul de pe api-v2.zrok.io pentru pornire.';
+  if (isEnabled) {
+    const overview = await getOverviewJson();
+    const localEnv = readLocalZrokEnv();
+    if (overview) {
+      envValid = true;
+      const whatsOmniEnvs = overview.environments.filter((e) => e.description === ZROK_ENV_DESC);
+      envDetails = `Token Zrok valid și sincronizat (${localEnv?.envZId || 'activ'}, medii server: ${whatsOmniEnvs.length}).`;
+    } else {
+      envDetails = 'Tokenul Zrok local este respins (401/expirat). Introdu tokenul actualizat și apasă Activează Token.';
+    }
+  }
   checks.push({
     id: 'environment',
     name: 'Mediu Zrok & Token Cont',
-    passed: isEnabled,
-    status: isEnabled ? 'PASS' : 'WARN',
-    details: isEnabled
-      ? 'Mediul Zrok este activat și pregătit pentru tunel public.'
-      : 'Tokenul Zrok nu a fost activat încă. Introdu tokenul de pe api-v2.zrok.io pentru pornire.',
+    passed: envValid,
+    status: envValid ? 'PASS' : isEnabled ? 'FAIL' : 'WARN',
+    details: envDetails,
     durationMs: Date.now() - t4,
   });
 
   // 5. End-to-end live public URL reachability check (if tunnel is currently running)
   const t5 = Date.now();
   if (zrokRunning && zrokPublicUrl) {
+    const normalizedLiveUrl = normalizeZrokUrl(zrokPublicUrl);
     try {
-      const liveRes = await fetch(`${zrokPublicUrl}/api/health`, {
+      const liveRes = await fetch(`${normalizedLiveUrl}/api/health`, {
         signal: AbortSignal.timeout(8000),
       });
       const liveJson: any = await liveRes.json().catch(() => ({}));
@@ -712,8 +1066,8 @@ export async function runZrokDiagnostics(port: number = 3000): Promise<ZrokDiagn
         passed: liveOk,
         status: liveOk ? 'PASS' : 'FAIL',
         details: liveOk
-          ? `Site-ul răspunde live prin internet la ${zrokPublicUrl} (HTTP ${liveRes.status}).`
-          : `Tunelul a returnat HTTP ${liveRes.status} la ${zrokPublicUrl}`,
+          ? `Site-ul răspunde live prin internet la ${normalizedLiveUrl} (HTTP ${liveRes.status}).`
+          : `Tunelul a returnat HTTP ${liveRes.status} la ${normalizedLiveUrl}`,
         durationMs: Date.now() - t5,
       });
     } catch (err: any) {
@@ -722,7 +1076,7 @@ export async function runZrokDiagnostics(port: number = 3000): Promise<ZrokDiagn
         name: 'Test End-to-End Link Public Zrok',
         passed: false,
         status: 'FAIL',
-        details: `Nu s-a putut accesa ${zrokPublicUrl}: ${err?.message || 'eroare'}`,
+        details: `Nu s-a putut accesa ${normalizedLiveUrl}: ${err?.message || 'eroare'}`,
         durationMs: Date.now() - t5,
       });
     }
@@ -732,7 +1086,7 @@ export async function runZrokDiagnostics(port: number = 3000): Promise<ZrokDiagn
       name: 'Test End-to-End Link Public Zrok',
       passed: false,
       status: 'WARN',
-      details: isEnabled
+      details: envValid
         ? 'Tunelul este oprit momentan. Apasă "Pornește Site-ul prin Zrok" pentru a testa URL-ul public live.'
         : 'În așteptarea activării tokenului și pornirii tunelului public.',
       durationMs: Date.now() - t5,
@@ -746,7 +1100,7 @@ export async function runZrokDiagnostics(port: number = 3000): Promise<ZrokDiagn
     overallStatus = 'ISSUE';
   } else if (liveCheck?.status === 'PASS') {
     overallStatus = 'LIVE';
-  } else if (!isEnabled) {
+  } else if (!envValid) {
     overallStatus = 'NEEDS_TOKEN';
   }
 
@@ -761,4 +1115,3 @@ export async function runZrokDiagnostics(port: number = 3000): Promise<ZrokDiagn
     checks,
   };
 }
-

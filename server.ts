@@ -11,7 +11,8 @@ import makeWASocket, {
   DisconnectReason, 
   jidNormalizedUser,
   Browsers,
-  fetchLatestWaWebVersion
+  fetchLatestWaWebVersion,
+  makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { Jimp } from 'jimp';
@@ -39,6 +40,22 @@ dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const serverStartTime = Date.now();
+let serverPort = 3000;
+
+// Filter noisy non-fatal libsignal per-message ratchet console.error logs (Baileys recovers automatically via retry receipts)
+const origConsoleError = console.error.bind(console);
+console.error = (...args: any[]) => {
+  const first = typeof args[0] === 'string' ? args[0] : '';
+  if (
+    first.includes('Failed to decrypt message with any known session') ||
+    first.startsWith('Session error:') ||
+    first.includes('Bad MAC')
+  ) {
+    console.warn('[WA_SIGNAL_RETRY] Retrying Signal session sync for incoming message...');
+    return;
+  }
+  origConsoleError(...args);
+};
 
 // Global process error handlers to prevent silent crashes
 process.on('unhandledRejection', (reason, promise) => {
@@ -1323,6 +1340,7 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
       // Clear Cloud Backup before recovery check so stale/incomplete creds do not resurrect
       try {
         await setSetting('baileys_creds_v2', '');
+        await setSetting('baileys_auth_bundle_v1', '');
       } catch (e) {}
       isConnected = false;
       isRegistered = false;
@@ -1338,16 +1356,31 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
       fs.mkdirSync(AUTH_FOLDER, { recursive: true });
     }
 
-    // --- CLOUD RECOVERY LOGIC ---
-    // If local creds.json is missing (and not forcing a clean reset), try to restore from Cloud SQL
+    // --- CLOUD RECOVERY LOGIC (Full Auth Bundle: creds + Signal session/pre-key/sender-key files) ---
     const credsFilePath = path.join(AUTH_FOLDER, 'creds.json');
     if (!forceNew && !fs.existsSync(credsFilePath)) {
       try {
-        const cloudCreds = await getSetting('baileys_creds_v2');
-        if (cloudCreds) {
-          console.log('Searching in Cloud... Found session backup! Restoring to local filesystem.');
-          fs.writeFileSync(credsFilePath, cloudCreds);
-          addLog('system', 'System', 'Sesiune recuperată automat din Cloud SQL! Se inițializează conectarea...');
+        const cloudBundleRaw = await getSetting('baileys_auth_bundle_v1');
+        if (cloudBundleRaw) {
+          const bundle = JSON.parse(cloudBundleRaw) as Record<string, string>;
+          if (bundle && typeof bundle['creds.json'] === 'string') {
+            for (const [fileName, content] of Object.entries(bundle)) {
+              const safeName = path.basename(fileName);
+              if (safeName.endsWith('.json') && typeof content === 'string') {
+                fs.writeFileSync(path.join(AUTH_FOLDER, safeName), content);
+              }
+            }
+            console.log(`Restored full WhatsApp auth bundle (${Object.keys(bundle).length} files) from Cloud SQL.`);
+            addLog('system', 'System', 'Sesiune și chei Signal recuperate complet din Cloud SQL!');
+          }
+        }
+        if (!fs.existsSync(credsFilePath)) {
+          const cloudCreds = await getSetting('baileys_creds_v2');
+          if (cloudCreds) {
+            console.log('Searching in Cloud... Found session backup! Restoring to local filesystem.');
+            fs.writeFileSync(credsFilePath, cloudCreds);
+            addLog('system', 'System', 'Sesiune recuperată automat din Cloud SQL! Se inițializează conectarea...');
+          }
         }
       } catch (err) {
         console.error('Error restoring from Cloud SQL:', err);
@@ -1355,7 +1388,41 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
     }
     // ----------------------------
 
+    const waLogger = pino({ level: 'silent' });
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+    const cachedKeys = makeCacheableSignalKeyStore(state.keys, waLogger);
+
+    let authBackupTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleFullAuthBackup = () => {
+      if (authBackupTimer) return;
+      authBackupTimer = setTimeout(async () => {
+        authBackupTimer = null;
+        if (!state.creds?.registered && !state.creds?.account) return;
+        try {
+          if (!fs.existsSync(AUTH_FOLDER)) return;
+          const files = fs.readdirSync(AUTH_FOLDER).filter((f) => f.endsWith('.json'));
+          if (!files.includes('creds.json')) return;
+          const bundle: Record<string, string> = {};
+          for (const f of files) {
+            try {
+              bundle[f] = fs.readFileSync(path.join(AUTH_FOLDER, f), 'utf-8');
+            } catch {}
+          }
+          if (bundle['creds.json']) {
+            await setSetting('baileys_creds_v2', bundle['creds.json']);
+            await setSetting('baileys_auth_bundle_v1', JSON.stringify(bundle));
+          }
+        } catch {}
+      }, 4000);
+    };
+
+    // Trigger debounced Cloud SQL backup whenever Signal keys (sessions/pre-keys/sender-keys) are updated
+    const origKeysSet = cachedKeys.set.bind(cachedKeys);
+    cachedKeys.set = async (data: any) => {
+      await origKeysSet(data);
+      scheduleFullAuthBackup();
+    };
+
     // Only consider a session paired/registered when Baileys has completed registration or received pairing account identity.
     // Do NOT check state.creds?.me?.id alone because requestPairingCode sets temporary creds.me before confirmation.
     isRegistered = !!state.creds?.registered || !!state.creds?.account;
@@ -1376,9 +1443,12 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
     }
 
     const socket = makeWASocket({
-      auth: state,
+      auth: {
+        creds: state.creds,
+        keys: cachedKeys,
+      },
       version: waVersion,
-      logger: pino({ level: 'silent' }),
+      logger: waLogger,
       printQRInTerminal: false,
       browser: Browsers.ubuntu('Chrome'),
       connectTimeoutMs: 60000,
@@ -1386,7 +1456,7 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
       defaultQueryTimeoutMs: 60000,
       markOnlineOnConnect: true,
       syncFullHistory: false,
-      retryRequestDelayMs: 250,
+      retryRequestDelayMs: 350,
     });
     waSocket = socket;
 
@@ -1396,12 +1466,7 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
       // Only backup genuinely paired/registered sessions to Cloud SQL
       if (state.creds?.registered || state.creds?.account) {
         isRegistered = true;
-        try {
-          const credsContent = fs.readFileSync(path.join(AUTH_FOLDER, 'creds.json'), 'utf-8');
-          await setSetting('baileys_creds_v2', credsContent);
-        } catch (err) {
-          // Non-fatal sync error
-        }
+        scheduleFullAuthBackup();
       }
     });
 
@@ -1441,8 +1506,7 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
         addLog('system', 'System', `WhatsApp Conectat Permanent! (+${userPhone})`);
         try {
           await saveCreds();
-          const credsContent = fs.readFileSync(path.join(AUTH_FOLDER, 'creds.json'), 'utf-8');
-          await setSetting('baileys_creds_v2', credsContent);
+          scheduleFullAuthBackup();
         } catch {}
       }
 
@@ -1454,13 +1518,12 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
 
         const error = lastDisconnect?.error;
         const statusCode = (error as any)?.output?.statusCode;
-        const errMsg = error?.message || String(error || '');
         const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
-        const isBadSession = errMsg.includes('Bad MAC') || errMsg.includes('decryption') || errMsg.includes('session');
+        const isBadSession = statusCode === DisconnectReason.badSession;
 
         if (isLoggedOut || isBadSession) {
           isRegistered = false;
-          const reason = isLoggedOut ? 'delogare / sesiune invalidă' : 'corupere sesiune (Bad MAC)';
+          const reason = isLoggedOut ? 'delogare / sesiune invalidă' : 'sesiune expirată (badSession 500)';
           addLog('system', 'System', `Sesiune întreruptă din cauza: ${reason}. Se resetează canalul pentru siguranță...`);
           console.warn(`[WA_SESSION_RESET] Resetting session due to: ${reason}`);
 
@@ -1469,6 +1532,7 @@ async function initBaileysInternal(forceNew: boolean = false): Promise<void> {
           } catch (e) {}
 
           await setSetting('baileys_creds_v2', '');
+          await setSetting('baileys_auth_bundle_v1', '');
 
           reconnectTimer = setTimeout(() => initBaileys(true), 2000);
         } else {
@@ -1748,6 +1812,34 @@ setInterval(() => {
   }
 }, 25000);
 
+// 24/7 Self-Ping Keep-Alive Watchdog (prevents container idling / sleep)
+setInterval(() => {
+  fetch(`http://127.0.0.1:${serverPort}/api/health`, { signal: AbortSignal.timeout(5000) })
+    .catch(() => {});
+}, 180000);
+
+// 24/7 Zrok Watchdog (auto-restarts Zrok tunnel if autoStart is true and tunnel dropped)
+setInterval(async () => {
+  try {
+    const status = await getZrokStatus();
+    if (status.autoStart && status.isEnabled && !status.isRunning) {
+      console.log('[ZROK_WATCHDOG] Tunnel dropped while autoStart is enabled. Re-launching Zrok tunnel...');
+      await startZrokTunnel(serverPort);
+    }
+  } catch {}
+}, 45000);
+
+// 24/7 Zrok External Public Keep-Alive (pings public Zrok URL externally every 2 minutes to keep Cloud Run container awake 24/7)
+setInterval(async () => {
+  try {
+    const status = await getZrokStatus();
+    if (status.isRunning && status.publicUrl) {
+      const pingUrl = `${status.publicUrl.replace(/\/+$/, '')}/api/health`;
+      await fetch(pingUrl, { signal: AbortSignal.timeout(6000) });
+    }
+  } catch {}
+}, 120000);
+
 // 24/7 Cloud SQL Heartbeat monitor: records uptime and session status
 setInterval(async () => {
   try {
@@ -1800,6 +1892,7 @@ async function startServer() {
   const app = express();
   app.set('trust proxy', true);
   const PORT = Number(process.env.PORT) || 3000;
+  serverPort = PORT;
 
   // Global request logging & no-store headers for API routes
   app.use('/api', (req, res, next) => {
@@ -1983,6 +2076,7 @@ async function startServer() {
     try {
       addLog('system', 'System', 'Sesiune resetată complet. Se șterge starea locală, BACKUP-UL din Cloud și se inițializează un nou canal...');
       await setSetting('baileys_creds_v2', '');
+      await setSetting('baileys_auth_bundle_v1', '');
       await initBaileys(true);
       res.json({ success: true, message: 'Sesiune reinițializată' });
     } catch (err: any) {

@@ -24,7 +24,7 @@ export const createPool = () => {
     });
 
     // Prevent unhandled pool-level errors from crashing the application and reset pool cleanly
-    newPool.on('error', (err) => {
+    newPool.on('error', (err: any) => {
       console.warn('Idle SQL pool client reset:', err?.message || err);
       if (global._postgresPool === newPool) {
         global._postgresPool = undefined;
@@ -38,14 +38,57 @@ export const createPool = () => {
   return global._postgresPool;
 };
 
-// Export db as a Proxy that dynamically resolves to a valid Drizzle instance, auto-recovering from dropped connections
+export function resetPool() {
+  if (global._postgresPool) {
+    try {
+      global._postgresPool.end().catch(() => {});
+    } catch {}
+    global._postgresPool = undefined;
+    global._drizzleDb = undefined;
+  }
+}
+
+// Export db as a Proxy with multi-attempt exponential backoff retry on transient Cloud SQL socket errors
 export const db = new Proxy({} as any, {
   get(target, prop) {
     const pool = createPool();
     if (!global._drizzleDb) {
       global._drizzleDb = drizzle(pool, { schema });
     }
-    return global._drizzleDb[prop];
+    const origMethod = global._drizzleDb[prop];
+    if (typeof origMethod === 'function') {
+      return function (...args: any[]) {
+        const queryBuilder = origMethod.apply(global._drizzleDb, args);
+        if (queryBuilder && typeof queryBuilder.then === 'function') {
+          return (async () => {
+            const maxAttempts = 3;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              try {
+                // Await fresh execution per attempt if retrying
+                if (attempt > 1) {
+                  resetPool();
+                  const freshPool = createPool();
+                  const freshDb = drizzle(freshPool, { schema });
+                  return await (freshDb as any)[prop](...args);
+                }
+                return await queryBuilder;
+              } catch (err: any) {
+                const msg = err?.message || '';
+                const isTransient = /ENOENT|ECONNREFUSED|ETIMEDOUT|terminating|connection|timeout/i.test(msg);
+                if (isTransient && attempt < maxAttempts) {
+                  const delay = attempt * 400;
+                  console.warn(`[DB_RETRY] Transient database error (attempt ${attempt}/${maxAttempts}): ${msg}. Retrying in ${delay}ms...`);
+                  await new Promise((r) => setTimeout(r, delay));
+                  continue;
+                }
+                throw err;
+              }
+            }
+          })();
+        }
+        return queryBuilder;
+      };
+    }
+    return origMethod;
   }
 });
-

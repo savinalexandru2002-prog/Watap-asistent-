@@ -3400,13 +3400,13 @@ export default function App() {
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div className="space-y-1">
                       <label className="text-[11px] font-semibold text-slate-400">
-                        Subdomeniu personalizat (opțional)
+                        Subdomeniu personalizat (min. 3 caractere, opțional)
                       </label>
                       <input
                         type="text"
                         value={zrokCustomNameInput}
                         onChange={(e) => setZrokCustomNameInput(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
-                        placeholder="ex: alexia-whatsapp"
+                        placeholder="ex: alexandru sau alexia-bot"
                         className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white focus:outline-none focus:border-cyan-500"
                       />
                     </div>
@@ -3428,7 +3428,17 @@ export default function App() {
                     <input
                       type="checkbox"
                       checked={zrokAutoStartInput}
-                      onChange={(e) => setZrokAutoStartInput(e.target.checked)}
+                      onChange={async (e) => {
+                        const checked = e.target.checked;
+                        setZrokAutoStartInput(checked);
+                        try {
+                          await fetch('/api/zrok/preferences', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ autoStart: checked }),
+                          });
+                        } catch {}
+                      }}
                       className="rounded border-slate-700 bg-slate-900 text-cyan-500 focus:ring-cyan-500"
                     />
                     <span>Pornește tunelul Zrok automat la fiecare pornire a serverului</span>
@@ -3437,7 +3447,7 @@ export default function App() {
                   <div className="flex flex-wrap items-center gap-3 pt-1">
                     <button
                       onClick={handleStartZrok}
-                      disabled={zrokActionLoading || (!zrokStatus?.isEnabled && !zrokTokenInput.trim())}
+                      disabled={zrokActionLoading || (!zrokStatus?.isEnabled && !zrokStatus?.hasToken && !zrokTokenInput.trim())}
                       className="flex-1 min-w-[180px] px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 cursor-pointer"
                     >
                       {zrokActionLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}

@@ -74,50 +74,9 @@ function splitSpeechChunks(text: string, maxLen: number = 175): string[] {
 async function generateRawSpeechFile(
   cleanText: string,
   tempDir: string,
-  aiClient: GoogleGenAI | null
+  _aiClient: GoogleGenAI | null
 ): Promise<{ filePath: string; engine: string }> {
-  // 1. Primary: Gemini 3.8 Flash Lite TTS (outputs complete 24kHz mono WAV)
-  if (aiClient) {
-    try {
-      const response = await aiClient.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: cleanText,
-                speechMetadata: {
-                  style: 'Natural, warm, conversational Romanian male voice on WhatsApp',
-                },
-              },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Charon' },
-            },
-          },
-        },
-      });
-      const b64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (b64) {
-        const wavBuf = Buffer.from(b64, 'base64');
-        if (wavBuf.length > 100) {
-          const wavPath = path.join(tempDir, 'speech.wav');
-          fs.writeFileSync(wavPath, wavBuf);
-          return { filePath: wavPath, engine: 'Gemini 3.8 Flash Lite TTS' };
-        }
-      }
-    } catch (geminiErr: any) {
-      console.warn('[MEDIA_TTS] Gemini TTS unavailable, switching to chunked Google TTS:', geminiErr?.message || geminiErr);
-    }
-  }
-
-  // 2. Fallback: Chunked Google Translate TTS (<=175 chars per chunk so HTTP 400 never happens)
+  // Use robust Chunked Google Translate TTS (<=175 chars per chunk)
   const chunks = splitSpeechChunks(cleanText, 175);
   const mp3Parts: Buffer[] = [];
   for (const chunk of chunks) {
@@ -144,7 +103,6 @@ async function generateRawSpeechFile(
   if (mp3Parts.length === 1) {
     fs.writeFileSync(mp3Path, mp3Parts[0]);
   } else {
-    // Concatenate cleanly via ffmpeg concat list to avoid ID3 header glitches
     const listLines: string[] = [];
     mp3Parts.forEach((part, idx) => {
       const p = path.join(tempDir, `part_${idx}.mp3`);
